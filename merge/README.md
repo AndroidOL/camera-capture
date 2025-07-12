@@ -4,7 +4,7 @@ https://www.tianhao.me/posts/rk-camera-capture-merge/
 
 是时候了，我们该把这些珍珠串联起来，让它们在光影的流动中，绽放出璀璨夺目的光芒。今天，我将向大家展示这个项目的最终章，也是我个人认为最激动人心的部分——打造一间全自动化的“时光放映室”。这个放映室的核心，是一个强大而可靠的Shell脚本。它是我整个系统的“幕后总导演”，肩负着神圣的使命：在每个寂静的黎明到来之前，将过去一天的万千照片，自动合成为一部部精彩纷呈的延时影片。
 
-项目代码：https://github.com/AndroidOL/camera-capture-merge
+项目代码：https://github.com/AndroidOL/camera-capture/tree/main/merge
 
 ## 从“素材堆积”到“影像诗篇”：最后的“亿”步
 
