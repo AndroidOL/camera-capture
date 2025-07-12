@@ -1,0 +1,64 @@
+[Unit]
+Description=Armbian Camera Capture Service
+Documentation=https://your-documentation-url-here.com # 可选：指向您的文档
+RequiresMountsFor=/opt/camera/captures
+After=multi-user.target network.target opt-camera-captures.mount
+# 如果明确知道摄像头设备，可以更精确地控制启动顺序
+# 例如: Wants=dev-video2.device After=dev-video2.device
+
+[Service]
+# ---- 基本配置 ----
+Type=simple
+WorkingDirectory=/opt/camera
+ExecStart=/opt/camera/opencv/bin/python /opt/camera/capture.py
+ExecStop=/bin/kill -TERM $MAINPID
+
+# ---- 自动重启策略 ----
+Restart=on-failure # 或 'always'。'on-failure' 表示仅在脚本以非0状态退出时重启
+RestartSec=10      # 重启前等待10秒
+StartLimitIntervalSec=300 # 在300秒内
+StartLimitBurst=5         # 最多尝试重启5次，防止无限重启循环
+
+# ---- 日志和环境 ----
+Environment="PYTHONUNBUFFERED=1"
+StandardOutput=journal # 将Python脚本的stdout重定向到systemd journal
+StandardError=journal  # 将Python脚本的stderr重定向到systemd journal
+SyslogIdentifier=armbian-camera-capture
+
+# ---- 安全性增强 (重要) ----
+# 限制文件系统访问
+ProtectSystem=strict     # /usr, /boot, /etc 设为只读
+ProtectHome=true         # /home, /root 目录不可访问
+PrivateTmp=true          # 使用私有的 /tmp 和 /var/tmp 目录
+PrivateDevices=true      # 默认不暴露设备，除非通过 DeviceAllow 明确允许
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX # 根据需要调整，如果只用本地设备，AF_UNIX可能就够了
+RestrictRealtime=true
+
+# 限制权限提升
+NoNewPrivileges=true
+
+# 明确允许访问摄像头设备 (假设是 /dev/video2)
+# DeviceAllow=/dev/video[1-6] rw
+DeviceAllow=/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._UGREEN_Camera_2K_SN0001-video-index0 rw
+# 如果还需要访问其他设备 (例如特定USB控制器)，也在此处添加
+
+# 进一步限制能力 (根据脚本实际需要的能力，尽可能减少)
+# 对于这个脚本，除了设备访问，可能不需要太多其他特殊能力
+CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_SYS_BOOT CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_TIME CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_LINUX_IMMUTABLE CAP_IPC_LOCK CAP_IPC_OWNER CAP_SYSLOG CAP_MAC_ADMIN CAP_MAC_OVERRIDE CAP_NET_BROADCAST CAP_NET_BIND_SERVICE CAP_AUDIT_CONTROL CAP_AUDIT_READ CAP_AUDIT_WRITE
+# 上面是排除了很多不必要的能力，保留了默认需要的一些基本能力。
+# 如果脚本非常简单，可以进一步收紧。
+
+# ---- 资源限制 (可选) ----
+# LimitNOFILE=1024        # 最大打开文件数
+# LimitNPROC=512          # 最大进程数
+# CPUQuota=50%            # CPU使用配额
+# MemoryMax=512M          # 最大内存使用
+
+# ---- 超时设置 ----
+TimeoutStopSec=30s        # 优雅停止的超时时间 (默认90s)
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,86 @@
+# ==============================================================================
+# Configuration file for Image Capture Service (v3.1.2)
+# ==============================================================================
+
+# --- Path Settings ---
+# Paths can use {base_app_dir} and {image_save_base_dir} placeholders
+# which will be resolved by the script.
+paths:
+  base_app_dir: "/opt/camera/image_capture_service"   # Base directory for logs and other app files
+  log_dir: "{base_app_dir}/logs"                      # Directory to store log files
+  pid_file: "/var/run/image_capture_service.pid"      # PID file for service management
+  image_save_base_dir: "/opt/camera/capture"          # Primary directory to save captured images
+  image_save_fallback_dir: "/opt/camera/capture_emmc" # Optional: Fallback if primary fails (e.g. different disk)
+
+# --- Logging Configuration ---
+logging:
+  level: "INFO" # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_file_name: "capture_service.log" # Name of the log file within log_dir
+  rotate_when: "midnight"     # Log rotation frequency: S, M, H, D, W0-W6 (weekday), midnight
+  rotate_interval: 1          # Interval for rotation (e.g., 1 for daily if when='D')
+  rotate_backup_count: 30     # Number of old log files to keep
+  enable_syslog: true         # Whether to also log to system's syslog
+  syslog_tag: "ImageCaptureSvc" # Tag used for syslog messages
+
+# --- Camera Configuration ---
+camera:
+  index_preference: "2" # Preferred camera index: "0", "1", ..., or "any" to try finding one
+  width: 1920           # Requested frame width
+  height: 1080          # Requested frame height
+  requested_fourcc: "YUYV" # Requested camera FOURCC (e.g., YUYV, MJPG). Case-sensitive.
+  jpeg_quality: 75      # JPEG save quality (0-100, higher is better quality/larger size)
+  
+  # Retry and backoff parameters for camera operations
+  parameter_set_retries: 3
+  parameter_set_delay_seconds: 0.5
+  init_failure_max_consecutive: 5    # Max consecutive complete init failures before long backoff
+  init_retry_delay_seconds: 15       # Delay between init retries after a failure
+  init_long_backoff_seconds: 300     # Long backoff after max_consecutive init failures (5 minutes)
+  max_consecutive_read_failures: 10  # Max consecutive cap.read() failures before longer pause/reset
+  read_failure_long_backoff_seconds: 60 # Pause after max_consecutive_read_failures
+  frame_read_error_retry_delay_seconds: 5 # Short pause after a single cap.read() failure
+  check_dev_node: true               # If true, check /dev/videoX existence before trying to open
+
+# --- Capture Schedule Configuration ---
+capture_schedule:
+  # Defines intervals active *until* the end_time_exclusive.
+  # Times are in HH:MM or HH:MM:SS format. Sorted by end_time_exclusive.
+  # The first rule implies starting from 00:00.
+  schedule_rules:
+    - {end_time_exclusive: "04:30", interval_seconds: 15} # 00:00:00 - 04:29:59
+    - {end_time_exclusive: "06:00", interval_seconds: 10} # 04:30:00 - 05:59:59
+    - {end_time_exclusive: "22:00", interval_seconds: 5}  # 06:00:00 - 21:59:59
+  # Interval for times >= the last end_time_exclusive in schedule_rules (i.e., 22:00 to midnight)
+  default_interval_late_night: 10
+
+# --- Image Processing Configuration ---
+image_processing:
+  enable_timestamp: true
+  timestamp_format: "%Y/%m/%d %H:%M:%S" # strftime format for timestamp overlay
+  
+  # Optional: Frame content sanity checks
+  enable_black_frame_detection: false
+  black_frame_threshold: 10.0            # Average pixel intensity below which frame is considered black
+  black_frame_consecutive_threshold: 3 # How many consecutive black frames trigger a warning/error
+
+  enable_static_frame_detection: false
+  static_frame_diff_threshold: 5.0       # Average pixel difference between frames below which it's considered static
+  static_frame_consecutive_threshold: 5# How many consecutive static frames trigger a warning/error
+  static_frame_resize_width: 160         # Resize frame to this width for faster static detection (None to disable resize)
+
+# --- Disk Management Configuration ---
+disk_management:
+  monitor_path: "{image_save_base_dir}" # Path to monitor disk usage on. Can be same as image_save_base_dir or its parent mount.
+                                        # {image_save_base_dir} will be replaced by the actual path.
+  max_usage_percent: 90                 # Percentage of disk usage above which cleanup is triggered
+  cleanup_batch_days: 1                 # Number of oldest days to delete in one cleanup cycle if over threshold
+  check_interval_seconds: 43200         # How often to check disk space (e.g., 3600 = 1 hour)
+  min_jpeg_save_size_bytes: 15360       # Minimum size in bytes for a saved JPEG to be considered valid (5KB)
+
+# --- Service Control Configuration ---
+service:
+  max_consecutive_imwrite_failures: 5 # Max consecutive image save failures before service considers stopping
+  systemd_watchdog_usec: null         # systemd Watchdog interval in microseconds (e.g., 30000000 for 30s).
+                                      # If set by systemd via WATCHDOG_USEC env var, that takes precedence.
+                                      # Script will ping watchdog at roughly half this interval.
+                                      # Requires python-systemd library. Set to null or 0 to disable.
