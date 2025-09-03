@@ -6,11 +6,11 @@
 # Paths can use {base_app_dir} and {image_save_base_dir} placeholders
 # which will be resolved by the script.
 paths:
-  base_app_dir: "/opt/camera/image_capture_service"   # Base directory for logs and other app files
+  base_app_dir: "/opt/camera"   # Base directory for logs and other app files
   log_dir: "{base_app_dir}/logs"                      # Directory to store log files
   pid_file: "/var/run/image_capture_service.pid"      # PID file for service management
-  image_save_base_dir: "/opt/camera/capture"          # Primary directory to save captured images
-  image_save_fallback_dir: "/opt/camera/capture_emmc" # Optional: Fallback if primary fails (e.g. different disk)
+  image_save_base_dir: "{base_app_dir}/capture"          # Primary directory to save captured images
+  image_save_fallback_dir: "{base_app_dir}/capture_emmc" # Optional: Fallback if primary fails (e.g. different disk)
 
 # --- Logging Configuration ---
 logging:
@@ -65,7 +65,7 @@ image_processing:
 
   enable_static_frame_detection: false
   static_frame_diff_threshold: 5.0       # Average pixel difference between frames below which it's considered static
-  static_frame_consecutive_threshold: 5# How many consecutive static frames trigger a warning/error
+  static_frame_consecutive_threshold: 5  # How many consecutive static frames trigger a warning/error
   static_frame_resize_width: 160         # Resize frame to this width for faster static detection (None to disable resize)
 
 # --- Disk Management Configuration ---

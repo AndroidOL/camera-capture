@@ -1,5 +1,32 @@
+"""
+嵌入式相机采集服务（自恢复、不可中断、低资源占用）。
+
+核心特性概述：
+- 前台常驻服务：按时间表周期抓拍图像，并保存到按年月/日分层的目录中
+- 自恢复：相机初始化失败、读帧失败、编码失败、磁盘满等异常不退出，按短/长退避重试
+- 健康心跳：周期性输出关键指标（失败计数、磁盘使用、平均处理耗时、最近一次保存路径、FOURCC、当前间隔）
+- 配置策略：默认使用内置常量；仅在 --use-config 时加载 YAML 并支持 SIGHUP 热重载（不更换日志目录）
+- 资源友好：相似度判断使用降采样灰度与形态学复用，日志节流，尽量减少内存复制与磁盘I/O
+
+目录结构与权限：
+- 日志目录默认在 /opt/camera/logs，图片在 /opt/camera/captures；PID 在 /var/run/。若不可写会尝试回退到 $HOME 或 /tmp
+- 在你的使用要求下：PID 创建失败将直接退出（保证 stop/status 可用）
+
+信号与控制：
+- SIGTERM/SIGINT：优雅停机（清理资源并退出）
+- SIGHUP：当启用配置时触发一次热重载（不重建日志 handler）
+
+可靠性策略（要点）：
+- 相机初始化：多次重试，超过阈值采用长退避
+- 读帧失败：短退避；连续失败到阈值采用长退避；日志按 N 次节流
+- 保存失败：计数到阈值后尝试磁盘清理 + 退避继续运行，不退出
+- OpenCV/未知异常：捕获并释放设备，按既定退避等待后重试
+"""
+
 import cv2
 import numpy as np
+import json
+import random
 import logging
 import logging.handlers
 import time
@@ -11,12 +38,21 @@ import shutil
 import traceback
 from datetime import datetime, time as dt_time
 from threading import Event
+from collections import deque
+
+# Optional YAML support for external configuration
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
 
 # --- Script Information ---
 SCRIPT_VERSION = "2.0.1"
 SCRIPT_NAME = os.path.basename(__file__)
 
 # --- Default Configuration ---
+# 注意：这些是脚本的“内置默认值”。在未显式传入 --use-config 时始终生效。
+# 若启用配置文件（--use-config），仅有明确在 YAML 中定义的键会覆盖对应默认值。
 BASE_APP_DIR = "/opt/camera/"
 LOG_DIR = os.path.join(BASE_APP_DIR, 'logs')
 PID_FILE_PATH = f"/var/run/{SCRIPT_NAME.replace('.py', '.pid')}"
@@ -38,7 +74,7 @@ JPEG_SAVE_QUALITY = 90
 CAPTURE_SCHEDULE_CONFIG = [
     {"end_time_exclusive": dt_time(5, 0), "interval_seconds": 10},
     {"end_time_exclusive": dt_time(6, 0),  "interval_seconds": 5},
-    {"end_time_exclusive": dt_time(21, 30),  "interval_seconds": 2.5},
+    {"end_time_exclusive": dt_time(21, 30),  "interval_seconds": 2},
     {"end_time_exclusive": dt_time(22, 30),  "interval_seconds": 5},
 ]
 DEFAULT_INTERVAL_LATE_NIGHT = 10
@@ -49,14 +85,15 @@ CAMERA_INIT_FAILURE_MAX_CONSECUTIVE = 5
 CAMERA_INIT_RETRY_DELAY_SECONDS = 15
 CAMERA_INIT_LONG_BACKOFF_SECONDS = 300
 
-# MODIFICATION v2.0.1: New config for read failures
+# 读帧失败退避控制（短退避 + 长退避）
 MAX_CONSECUTIVE_READ_FAILURES = 10 # Max consecutive cap.read() failures before longer pause
 READ_FAILURE_LONG_BACKOFF_SECONDS = 60 # Longer pause after max read failures
 
 FRAME_READ_ERROR_RETRY_DELAY_SECONDS = 5 # Short delay after a single read failure
 
-# MODIFICATION v2.0.1: New config for imwrite failures
+# 写盘失败退避控制
 MAX_CONSECUTIVE_IMWRITE_FAILURES = 5 # Max consecutive cv2.imwrite() failures before shutdown
+IMWRITE_FAILURE_BACKOFF_SECONDS = 60  # Backoff instead of stopping the service
 
 ENABLE_TIMESTAMP = True
 TIMESTAMP_FORMAT = "%Y/%m/%d %H:%M:%S"
@@ -65,14 +102,22 @@ IMAGE_STORAGE_MONITOR_PATH = IMAGE_SAVE_BASE_DIR
 IMAGE_STORAGE_MAX_USAGE_PERCENT = 85
 IMAGE_STORAGE_CLEANUP_BATCH_DAYS = 1
 DISK_CHECK_INTERVAL_SECONDS = 14400
+HEARTBEAT_INTERVAL_SECONDS = 300
+
+# 额外的可选配置（通过 YAML 启用）
+MIN_JPEG_SAVE_SIZE_BYTES = 0  # 若>0，则保存后检查文件尺寸，小于阈值视为失败
+IMAGE_SAVE_FALLBACK_DIR: str | None = None  # 备选保存目录（创建主目录失败或磁盘满时尝试）
 
 # --- Global Variables ---
 logger = None
 shutdown_event = Event()
+reload_event = Event()
+CONFIG_PATH = '/opt/camera/config.yaml'
+CONFIG_ENABLED = False
 consecutive_imwrite_failures = 0 # MODIFICATION v2.0.1
 consecutive_read_failures = 0    # MODIFICATION v2.0.1
 
-# 默认的轮廓比较参数 (可以根据您的实际测试调整这些值)
+# 相似度比较参数（差分 + 形态学 + 轮廓面积比例）
 DEFAULT_CONTOUR_PIXEL_THRESHOLD = 25   # 用于生成初始差异图的像素强度阈值
 DEFAULT_CONTOUR_KERNEL_SIZE = (5, 5)   # 形态学膨胀操作的卷积核大小
 DEFAULT_CONTOUR_DILATION_ITERATIONS = 2 # 膨胀操作的迭代次数
@@ -80,10 +125,21 @@ DEFAULT_CONTOUR_MIN_AREA_FILTER = 50.0 # 过滤掉小于此面积的差异轮廓
 
 last_significant_frame = None
 SIMILARITY_THRESHOLD_PERCENT_INT = 100 # 例如0.5%
+SIMILARITY_MAX_WIDTH = 640  # 相似度计算时的最大宽度（降低分辨率以节省CPU）
+LOG_EVERY_N_READ_FAILURES = 5  # 读帧失败的日志节流
+
+# 复用的形态学内核，避免频繁分配
+CONTOUR_KERNEL = np.ones(DEFAULT_CONTOUR_KERNEL_SIZE, np.uint8)
 
 # --- Logging Setup ---
 # (setup_logging_system function from v2.0.0 is unchanged)
 def setup_logging_system(log_dir, log_file_prefix, level_str, when, interval, backup_count):
+    """初始化日志系统。
+
+    - 创建/复用日志记录器，设置统一的格式与轮转策略
+    - 控制台与文件双通道输出
+    - 保守处理，避免日志异常影响主流程
+    """
     global logger
     numeric_level = getattr(logging, level_str.upper(), logging.INFO)
 
@@ -96,6 +152,8 @@ def setup_logging_system(log_dir, log_file_prefix, level_str, when, interval, ba
 
     logger = logging.getLogger(SCRIPT_NAME)
     logger.setLevel(numeric_level)
+    # 避免日志写入异常导致程序抛出异常
+    logging.raiseExceptions = False
     
     ## current_date_str = datetime.now().strftime("_%Y_%m_%d") # 例如：_2023_10_27
     ## current_date_str_new = datetime.now().strftime("%Y-%m-%d")
@@ -106,7 +164,7 @@ def setup_logging_system(log_dir, log_file_prefix, level_str, when, interval, ba
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    formatter = logging.Formatter('%(asctime)s [%(levelname)-7s] [%(name)s:%(funcName)s:%(lineno)d] %(message)s')
+    formatter = logging.Formatter('%(asctime)s [%(levelname)-7s] [%(process)d] [%(threadName)s] [%(name)s:%(funcName)s:%(lineno)d] %(message)s')
     
     ## log_filepath = os.path.join(log_dir, actual_log_file_name)
     try:
@@ -124,34 +182,286 @@ def setup_logging_system(log_dir, log_file_prefix, level_str, when, interval, ba
     ch.setFormatter(formatter)
     logger.addHandler(ch)
     
-    logger.info(f"Logging initialized. Level: {level_str}. File: {log_filepath}")
+    logger.info(f"[LOG] 初始化完成，级别: {level_str}，文件: {log_filepath}")
     return logger
+
+
+class ServiceState:
+    """封装服务运行期的可变状态，便于测试与热更新。
+
+    仅包含“动态”数据，避免与配置常量耦合，便于单元测试与重放。
+    """
+    def __init__(self) -> None:
+        self.consecutive_imwrite_failures: int = 0
+        self.consecutive_read_failures: int = 0
+        self.last_significant_frame: np.ndarray | None = None
+        self.total_disk_cleanup_batches: int = 0
+        self.last_heartbeat_monotonic: float = 0.0
+        self.last_saved_filepath: str | None = None
+        self.processing_times_ms: deque[float] = deque(maxlen=120)  # 固定窗口，均摊内存与操作成本
+        self.effective_fourcc: str = "NOT_SET_INITIALLY"
+        self.boot_id: str = f"{int(time.time())}-{random.randint(1000,9999)}"
+        self.last_health_dump_monotonic: float = 0.0
+        # 已应用到相机的请求参数（用于热重载后变更检测）
+        self.applied_camera_device: str | None = None
+        self.applied_width: int | None = None
+        self.applied_height: int | None = None
+        self.applied_requested_fourcc: str | None = None
+
+
+def log_heartbeat(state: 'ServiceState', current_interval_seconds: float) -> None:
+    """输出健康心跳。
+
+    内容包含：
+    - 连续读帧失败次数/连续写盘失败次数
+    - 已完成的磁盘清理批次数
+    - 当前拍摄间隔（秒）
+    - 平均处理耗时（毫秒，滑动窗口）
+    - 最近一次保存的文件路径（如有）
+    - 当前有效 FOURCC
+    - 监控路径磁盘使用率
+    """
+    try:
+        # 采样平均处理耗时
+        avg_ms = 0.0
+        if state.processing_times_ms:
+            avg_ms = sum(state.processing_times_ms) / len(state.processing_times_ms)
+
+        # 磁盘占用
+        try:
+            usage = shutil.disk_usage(IMAGE_STORAGE_MONITOR_PATH)
+            percent_used = (usage.used / usage.total) * 100.0
+        except Exception:
+            percent_used = -1.0
+
+        logger.info(
+            (
+                "Heartbeat | boot_id=%s, read_failures=%d, imwrite_failures=%d, disk_cleanup_batches=%d, "
+                "interval=%.3fs, avg_processing=%.2fms, last_saved='%s', fourcc='%s', disk_used=%.1f%%"
+            ),
+            state.boot_id,
+            state.consecutive_read_failures,
+            state.consecutive_imwrite_failures,
+            state.total_disk_cleanup_batches,
+            float(current_interval_seconds),
+            avg_ms,
+            state.last_saved_filepath or "",
+            state.effective_fourcc,
+            percent_used,
+        )
+    except Exception:
+        # 保守处理，心跳日志不能影响主流程
+        pass
+
+def load_and_apply_yaml_config(config_path: str, runtime_reload: bool = False):
+    """可选：加载 YAML 配置并覆盖内置参数（未启用时跳过）。
+
+    - runtime_reload=True 表示热重载（不改变日志目录，避免切换 handler）
+    - 出错只记录，不影响主流程
+    """
+    global DEFAULT_CAMERA_DEVICE_PATH, DEFAULT_WIDTH, DEFAULT_HEIGHT, REQUESTED_FOURCC
+    global JPEG_SAVE_QUALITY, IMAGE_SAVE_BASE_DIR, LOG_DIR, PID_FILE_PATH
+    global CAPTURE_SCHEDULE_CONFIG, DEFAULT_INTERVAL_LATE_NIGHT
+    global IMAGE_STORAGE_MONITOR_PATH, IMAGE_STORAGE_MAX_USAGE_PERCENT
+    global DISK_CHECK_INTERVAL_SECONDS, IMAGE_STORAGE_CLEANUP_BATCH_DAYS
+    global SIMILARITY_THRESHOLD_PERCENT_INT, MIN_JPEG_SAVE_SIZE_BYTES
+    global IMAGE_SAVE_FALLBACK_DIR, LOG_LEVEL_CONFIG, LOG_ROTATE_WHEN, LOG_ROTATE_INTERVAL, LOG_ROTATE_BACKUP_COUNT
+    global BASE_APP_DIR, LOG_FILE_NAME, MAX_CONSECUTIVE_IMWRITE_FAILURES
+    global ENABLE_TIMESTAMP, TIMESTAMP_FORMAT
+
+    if yaml is None:
+        if logger:
+            logger.warning("未安装 PyYAML，跳过外部配置加载。")
+        return
+    try:
+        if not os.path.isfile(config_path):
+            if logger:
+                logger.info(f"未找到配置文件 {config_path}，继续使用内置配置。")
+            return
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_cfg = yaml.safe_load(f) or {}
+
+        # 兼容旧版（扁平结构）
+        flat = raw_cfg
+        nested = raw_cfg if isinstance(raw_cfg, dict) else {}
+
+        def _resolve_placeholders(text: str) -> str:
+            if not isinstance(text, str):
+                return text
+            try:
+                base_app_dir_local = nested.get("paths", {}).get("base_app_dir", BASE_APP_DIR)
+                image_base_dir_local = nested.get("paths", {}).get("image_save_base_dir", IMAGE_SAVE_BASE_DIR)
+                mapping = {
+                    "base_app_dir": base_app_dir_local,
+                    "image_save_base_dir": image_base_dir_local,
+                }
+                return text.format(**mapping)
+            except Exception:
+                return text
+
+        # --- paths ---
+        paths_cfg = nested.get("paths", {}) if isinstance(nested.get("paths", {}), dict) else {}
+        base_app_dir_val = _resolve_placeholders(paths_cfg.get("base_app_dir", BASE_APP_DIR))
+        image_save_base_dir_val = _resolve_placeholders(paths_cfg.get("image_save_base_dir", IMAGE_SAVE_BASE_DIR))
+        image_save_fallback_dir_val = _resolve_placeholders(paths_cfg.get("image_save_fallback_dir", IMAGE_SAVE_FALLBACK_DIR or ""))
+        log_dir_val = _resolve_placeholders(paths_cfg.get("log_dir", LOG_DIR))
+        pid_file_val = _resolve_placeholders(paths_cfg.get("pid_file", PID_FILE_PATH))
+
+        # 仅在非运行时热重载时允许更改关键路径（避免切换 handler）
+        if not runtime_reload:
+            try:
+                BASE_APP_DIR = str(base_app_dir_val)
+            except Exception:
+                pass
+            try:
+                LOG_DIR = str(log_dir_val)
+            except Exception:
+                pass
+            try:
+                PID_FILE_PATH = str(pid_file_val)
+            except Exception:
+                pass
+
+        try:
+            IMAGE_SAVE_BASE_DIR = str(image_save_base_dir_val)
+        except Exception:
+            pass
+        IMAGE_STORAGE_MONITOR_PATH = IMAGE_SAVE_BASE_DIR
+        if image_save_fallback_dir_val:
+            try:
+                IMAGE_SAVE_FALLBACK_DIR = str(image_save_fallback_dir_val)
+            except Exception:
+                IMAGE_SAVE_FALLBACK_DIR = None
+
+        # --- logging ---
+        logging_cfg = nested.get("logging", {}) if isinstance(nested.get("logging", {}), dict) else {}
+        try:
+            LOG_LEVEL_CONFIG = str(logging_cfg.get("level", LOG_LEVEL_CONFIG))
+        except Exception:
+            pass
+        try:
+            tmp_name = logging_cfg.get("log_file_name")
+            if isinstance(tmp_name, str) and tmp_name.strip():
+                LOG_FILE_NAME = tmp_name.strip().replace(".log", "").replace("/", "_")
+        except Exception:
+            pass
+        LOG_ROTATE_WHEN = str(logging_cfg.get("rotate_when", LOG_ROTATE_WHEN))
+        LOG_ROTATE_INTERVAL = int(logging_cfg.get("rotate_interval", LOG_ROTATE_INTERVAL))
+        LOG_ROTATE_BACKUP_COUNT = int(logging_cfg.get("rotate_backup_count", LOG_ROTATE_BACKUP_COUNT))
+
+        # --- camera ---
+        cam_cfg = nested.get("camera", {}) if isinstance(nested.get("camera", {}), dict) else {}
+        DEFAULT_CAMERA_DEVICE_PATH = flat.get("camera_device", DEFAULT_CAMERA_DEVICE_PATH)
+        DEFAULT_WIDTH = int(cam_cfg.get("width", flat.get("width", DEFAULT_WIDTH)))
+        DEFAULT_HEIGHT = int(cam_cfg.get("height", flat.get("height", DEFAULT_HEIGHT)))
+        REQUESTED_FOURCC = str(cam_cfg.get("requested_fourcc", flat.get("fourcc", REQUESTED_FOURCC)))
+        JPEG_SAVE_QUALITY = int(cam_cfg.get("jpeg_quality", flat.get("jpeg_quality", JPEG_SAVE_QUALITY)))
+
+        # --- schedule ---
+        schedule_new = []
+        sched_cfg = nested.get("capture_schedule", {}) if isinstance(nested.get("capture_schedule", {}), dict) else {}
+        rules = sched_cfg.get("schedule_rules")
+        if isinstance(rules, list):
+            for item in rules:
+                try:
+                    end_str = str(item.get("end_time_exclusive", "00:00"))
+                    parts = [int(p) for p in end_str.split(":")]
+                    while len(parts) < 3: parts.append(0)
+                    end_t = dt_time(parts[0], parts[1], parts[2])
+                    interval = float(item.get("interval_seconds", 2.5))
+                    schedule_new.append({"end_time_exclusive": end_t, "interval_seconds": interval})
+                except Exception:
+                    continue
+        legacy_schedule = flat.get("schedule")
+        if isinstance(legacy_schedule, list):
+            for item in legacy_schedule:
+                try:
+                    hh, mm = str(item.get("end", "00:00")).split(":")
+                    end_t = dt_time(int(hh), int(mm))
+                    interval = float(item.get("interval_seconds", 2.5))
+                    schedule_new.append({"end_time_exclusive": end_t, "interval_seconds": interval})
+                except Exception:
+                    continue
+        if schedule_new:
+            CAPTURE_SCHEDULE_CONFIG = schedule_new
+        DEFAULT_INTERVAL_LATE_NIGHT = float(sched_cfg.get("default_interval_late_night", flat.get("default_interval_late_night", DEFAULT_INTERVAL_LATE_NIGHT)))
+
+        # --- image processing ---
+        img_cfg = nested.get("image_processing", {}) if isinstance(nested.get("image_processing", {}), dict) else {}
+        try:
+            ENABLE_TIMESTAMP = bool(img_cfg.get("enable_timestamp", ENABLE_TIMESTAMP))
+        except Exception:
+            pass
+        try:
+            TIMESTAMP_FORMAT = str(img_cfg.get("timestamp_format", TIMESTAMP_FORMAT))
+        except Exception:
+            pass
+
+        # --- disk management ---
+        disk_cfg = nested.get("disk_management", {}) if isinstance(nested.get("disk_management", {}), dict) else {}
+        monitor_path_val = _resolve_placeholders(disk_cfg.get("monitor_path", IMAGE_STORAGE_MONITOR_PATH))
+        try:
+            IMAGE_STORAGE_MONITOR_PATH = str(monitor_path_val) if monitor_path_val else IMAGE_SAVE_BASE_DIR
+        except Exception:
+            IMAGE_STORAGE_MONITOR_PATH = IMAGE_SAVE_BASE_DIR
+        IMAGE_STORAGE_MAX_USAGE_PERCENT = int(disk_cfg.get("max_usage_percent", flat.get("disk_usage_max_percent", IMAGE_STORAGE_MAX_USAGE_PERCENT)))
+        IMAGE_STORAGE_CLEANUP_BATCH_DAYS = int(disk_cfg.get("cleanup_batch_days", IMAGE_STORAGE_CLEANUP_BATCH_DAYS))
+        DISK_CHECK_INTERVAL_SECONDS = int(disk_cfg.get("check_interval_seconds", DISK_CHECK_INTERVAL_SECONDS))
+        MIN_JPEG_SAVE_SIZE_BYTES = int(disk_cfg.get("min_jpeg_save_size_bytes", MIN_JPEG_SAVE_SIZE_BYTES))
+
+        # --- service ---
+        svc_cfg = nested.get("service", {}) if isinstance(nested.get("service", {}), dict) else {}
+        MAX_CONSECUTIVE_IMWRITE_FAILURES = int(svc_cfg.get("max_consecutive_imwrite_failures", MAX_CONSECUTIVE_IMWRITE_FAILURES))
+
+        # --- similarity --- （兼容旧配置）
+        SIMILARITY_THRESHOLD_PERCENT_INT = int(flat.get("similarity_threshold_percent_int", SIMILARITY_THRESHOLD_PERCENT_INT))
+
+        if logger:
+            logger.info(f"配置文件已加载: {config_path}")
+    except Exception as e:
+        if logger:
+            logger.error(f"加载配置文件失败 {config_path}: {e}")
+        else:
+            print(f"WARNING: Failed to load config {config_path}: {e}", file=sys.stderr)
+
+
+def signal_hup_handler(signum, frame):
+    """SIGHUP 信号处理：触发配置热重载请求。"""
+    try:
+        if logger:
+            logger.info(f"接收到 SIGHUP ({signum})，请求重载配置。")
+    finally:
+        reload_event.set()
 
 # --- PID File Management ---
 # (create_pid_file, remove_pid_file functions from v2.0.0 are unchanged)
 def create_pid_file():
+    """创建 PID 文件用于 stop/status 操作，失败则退出。"""
     if not PID_FILE_PATH: return
     try:
         pid = os.getpid()
         os.makedirs(os.path.dirname(PID_FILE_PATH), exist_ok=True)
         with open(PID_FILE_PATH, 'w') as f:
             f.write(str(pid))
-        logger.info(f"PID file created at {PID_FILE_PATH} with PID {pid}")
+        logger.info(f"[PID] 创建成功: {PID_FILE_PATH} (PID={pid})")
     except IOError as e:
         logger.error(f"Unable to create PID file {PID_FILE_PATH}: {e}")
+        # 无法创建 PID 文件会影响 stop/status 的可操作性，这里按照你的要求直接退出
         sys.exit(1)
 
 def remove_pid_file():
+    """移除 PID 文件，失败仅记录警告。"""
     if not PID_FILE_PATH: return
     try:
         if os.path.exists(PID_FILE_PATH):
             os.remove(PID_FILE_PATH)
-            logger.info(f"PID file {PID_FILE_PATH} removed.")
+            logger.info(f"[PID] 已移除: {PID_FILE_PATH}")
     except IOError as e:
         logger.warning(f"Unable to remove PID file {PID_FILE_PATH}: {e}")
 
 # --- Signal Handling ---
 def signal_term_handler(signum, frame):
+    """SIGTERM/SIGINT 处理：发出优雅停机信号。"""
     msg = f"接收到信号 {signal.Signals(signum).name} ({signum})，开始优雅停机..."
     if logger: logger.info(msg)
     else: print(msg, file=sys.stderr)
@@ -161,6 +471,7 @@ def signal_term_handler(signum, frame):
 # (get_fourcc_str, set_camera_parameter, initialize_camera, add_timestamp_to_frame
 #  from v2.0.0 are good, ensure logger is used, and set_camera_parameter uses shutdown_event.wait)
 def get_fourcc_str(fourcc_int: int) -> str: # Identical to v2.0.0
+    """将四字符码整数转为字符串，用于日志展示。"""
     if fourcc_int == 0: return "N/A (0)"
     try:
         return "".join([chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)]).strip()
@@ -170,12 +481,24 @@ def get_fourcc_str(fourcc_int: int) -> str: # Identical to v2.0.0
 
 def set_camera_parameter(cap: cv2.VideoCapture, prop_id: int, value, param_name: str, 
                          retries: int = PARAMETER_SET_RETRIES, delay: float = PARAMETER_SET_DELAY_SECONDS) -> bool: # Identical to v2.0.0
+    """带重试的相机参数设置。
+
+    - 写入后短暂等待，再读取确认
+    - 各类异常只记录日志，不中断
+    """
     logger.info(f"尝试设置摄像头参数 {param_name} 为 {value}")
     for i in range(retries):
-        cap.set(prop_id, value)
+        try:
+            cap.set(prop_id, value)
+        except Exception as e:
+            logger.warning(f"设置 {param_name} 时出现异常: {e}")
         if shutdown_event.wait(timeout=delay): return False # Shutdown requested
 
-        actual_value = cap.get(prop_id)
+        try:
+            actual_value = cap.get(prop_id)
+        except Exception as e:
+            logger.warning(f"读取 {param_name} 当前值时出现异常: {e}")
+            actual_value = value
         is_set = False
         requested_value_for_log = value
         actual_value_for_log = actual_value
@@ -204,14 +527,19 @@ def set_camera_parameter(cap: cv2.VideoCapture, prop_id: int, value, param_name:
     return False
 
 def initialize_camera(camera_path: str, width: int, height: int, req_fourcc_str: str): # Identical to v2.0.0
-    logger.info(f"尝试打开并初始化设备 {camera_path} (使用 V4L2 后端)")
+    """打开并初始化摄像头，设置 FOURCC/FPS/分辨率，返回 (cap, 实际FOURCC)。"""
+    logger.info(f"[CAMERA] 打开并初始化设备: {camera_path} (V4L2)")
     
     device_path = camera_path
     if not os.path.exists(device_path):
         logger.error(f"摄像头设备节点 {device_path} 不存在。")
         return None, "NODE_NOT_FOUND"
 
-    cap = cv2.VideoCapture(camera_path, cv2.CAP_V4L2)
+    try:
+        cap = cv2.VideoCapture(camera_path, cv2.CAP_V4L2)
+    except Exception as e:
+        logger.error(f"创建 VideoCapture 失败: {e}")
+        return None, "OPEN_FAILED_EXCEPTION"
 
     if not cap.isOpened():
         logger.error(f"无法打开摄像头 {camera_path}")
@@ -223,10 +551,19 @@ def initialize_camera(camera_path: str, width: int, height: int, req_fourcc_str:
         set_camera_parameter(cap, cv2.CAP_PROP_FOURCC, target_fourcc_int, "FOURCC")
     
     set_camera_parameter(cap, cv2.CAP_PROP_FPS, 10, "FPS")
+    # Try to reduce internal buffering/latency where supported
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
 
     if shutdown_event.is_set(): cap.release(); return None, "SHUTDOWN_DURING_INIT"
     time.sleep(0.1) 
-    current_fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
+    try:
+        current_fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
+    except Exception as e:
+        logger.warning(f"读取 FOURCC 失败: {e}")
+        current_fourcc_int = 0
     effective_fourcc = get_fourcc_str(current_fourcc_int)
     if req_fourcc_str and effective_fourcc.upper() != req_fourcc_str.upper():
          logger.warning(f"请求的FOURCC {req_fourcc_str} 未能精确设置，摄像头实际为 {effective_fourcc}")
@@ -237,15 +574,19 @@ def initialize_camera(camera_path: str, width: int, height: int, req_fourcc_str:
     if shutdown_event.is_set(): cap.release(); return None, "SHUTDOWN_DURING_INIT"
     
     time.sleep(0.2) 
-    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps_val = cap.get(cv2.CAP_PROP_FPS) 
-    current_fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC)) 
+    try:
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps_val = cap.get(cv2.CAP_PROP_FPS) 
+        current_fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC)) 
+    except Exception as e:
+        logger.warning(f"读取相机属性失败: {e}")
+        actual_width, actual_height, actual_fps_val, current_fourcc_int = width, height, 0.0, 0
     effective_fourcc = get_fourcc_str(current_fourcc_int)
 
-    logger.info(f"摄像头 {camera_path} 初始化完成。")
-    logger.info(f"  请求参数 -> FOURCC: {req_fourcc_str if req_fourcc_str else 'N/A'}, 尺寸: {width}x{height}")
-    logger.info(f"  实际参数 -> FOURCC: {effective_fourcc} ({hex(current_fourcc_int)}), "
+    logger.info(f"[CAMERA] 初始化完成: {camera_path}")
+    logger.info(f"[CAMERA] 请求参数 -> FOURCC: {req_fourcc_str if req_fourcc_str else 'N/A'}, 尺寸: {width}x{height}")
+    logger.info(f"[CAMERA] 实际参数 -> FOURCC: {effective_fourcc} ({hex(current_fourcc_int)}), "
                 f"尺寸: {actual_width}x{actual_height}, "
                 f"报告FPS: {actual_fps_val:.2f}")
     
@@ -255,6 +596,7 @@ def initialize_camera(camera_path: str, width: int, height: int, req_fourcc_str:
     return cap, effective_fourcc
 
 def add_timestamp_to_frame(frame_to_modify, timestamp_format_str): # Identical to v2.0.0
+    """在图像右下角叠加时间戳，返回新图像。"""
     if not ENABLE_TIMESTAMP:
         return frame_to_modify
     timestamp_text = datetime.now().strftime(timestamp_format_str)
@@ -277,22 +619,18 @@ def add_timestamp_to_frame(frame_to_modify, timestamp_format_str): # Identical t
 def are_frames_similar(frame1: np.ndarray | None,
                        frame2: np.ndarray | None,
                        similarity_diff_rate_threshold_int: int) -> bool:
-    """
-    比较两个帧的相似度，基于轮廓面积差异率。
-    帧的顺序无关。
+    """比较两帧图像是否“足够相似”（变化很小）。
 
-    参数:
-        frame1: 第一个帧 (NumPy array) 或 None。
-        frame2: 第二个帧 (NumPy array) 或 None。
-        similarity_diff_rate_threshold_int (int): 相似度百分比阈值。
-            这是一个整数，例如 50 代表差异率上限为 0.50%。
-            如果实际差异率 <= 此阈值对应的百分比，则认为帧相似。
+    方法：
+    1) 必要时降采样到较小宽度以节省 CPU
+    2) 转灰度，做绝对差阈值化
+    3) 形态学膨胀，再提取轮廓，累计有效轮廓面积占比
+    4) 若面积差异率 <= 阈值（单位：百分比×1/100），视为相似
 
-    返回:
-        bool:
-            - 如果任一帧无法解析为有效图像 (例如 None 或类型不对)，返回 False (不相似/无法比较)。
-            - 如果轮廓面积差异率 <= (similarity_diff_rate_threshold_int / 100.0)%，返回 True (相似/变化小)。
-            - 否则 (差异率较大)，返回 False (不相似/变化大)。
+    返回 False 的情况：
+    - 任一帧不是有效的 numpy 图像
+    - 尺寸对齐失败或颜色转换失败
+    - 实际差异率超阈值
     """
 
     # 1. 检查输入帧的有效性
@@ -304,13 +642,30 @@ def are_frames_similar(frame1: np.ndarray | None,
         logger.debug("are_frames_similar: frame2 无效 (非 NumPy 数组、None 或空数组)。返回 False。")
         return False
 
-    # 2. 确保图像尺寸相同 (将 frame2 调整为 frame1 的尺寸)
+    # 2. 如有必要先下采样以降低分辨率（节省CPU），再确保尺寸相同
     h1, w1 = frame1.shape[:2]
     h2, w2 = frame2.shape[:2]
     frame2_resized = frame2
 
+    # 下采样比例（按宽度上限等比缩小）
+    if w1 > SIMILARITY_MAX_WIDTH:
+        scale1 = SIMILARITY_MAX_WIDTH / float(w1)
+        new_w1, new_h1 = int(w1 * scale1), int(h1 * scale1)
+        try:
+            frame1 = cv2.resize(frame1, (new_w1, new_h1), interpolation=cv2.INTER_AREA)
+        except cv2.error:
+            return False
+        h1, w1 = frame1.shape[:2]
+    if w2 > SIMILARITY_MAX_WIDTH:
+        scale2 = SIMILARITY_MAX_WIDTH / float(w2)
+        new_w2, new_h2 = int(w2 * scale2), int(h2 * scale2)
+        try:
+            frame2 = cv2.resize(frame2, (new_w2, new_h2), interpolation=cv2.INTER_AREA)
+        except cv2.error:
+            return False
+        h2, w2 = frame2.shape[:2]
+
     if (h1, w1) != (h2, w2):
-        return False
         logger.debug(f"are_frames_similar: 帧尺寸不同。将 frame2 从 ({w2}x{h2}) 调整为 ({w1}x{h1})。")
         try:
             frame2_resized = cv2.resize(frame2, (w1, h1), interpolation=cv2.INTER_AREA)
@@ -340,21 +695,36 @@ def are_frames_similar(frame1: np.ndarray | None,
         logger.error(f"are_frames_similar: 转换为灰度图失败: {e}。返回 False。")
         return False
 
+    # 3.5 再次确保尺寸与 dtype 一致
+    try:
+        if gray1.shape != gray2.shape:
+            logger.debug(f"are_frames_similar: 灰度尺寸不一致 {gray1.shape} vs {gray2.shape}，调整 gray2 以匹配 gray1。")
+            gray2 = cv2.resize(gray2, (gray1.shape[1], gray1.shape[0]), interpolation=cv2.INTER_AREA)
+        if gray1.dtype != gray2.dtype:
+            logger.debug(f"are_frames_similar: 灰度 dtype 不一致 {gray1.dtype} vs {gray2.dtype}，转换 gray2 dtype。")
+            gray2 = gray2.astype(gray1.dtype, copy=False)
+    except Exception as e:
+        logger.error(f"are_frames_similar: 对齐尺寸/dtype 时异常: {e}。返回 False。")
+        return False
+
     # 4. 计算轮廓面积差异率
     image_total_pixels = gray1.shape[0] * gray1.shape[1]
     if image_total_pixels == 0:
         logger.debug("are_frames_similar: 图像总像素为0。返回 False。")
         return False
 
-    abs_diff_img = cv2.absdiff(gray1, gray2)
+    try:
+        abs_diff_img = cv2.absdiff(gray1, gray2)
+    except cv2.error as e:
+        logger.error(f"are_frames_similar: absdiff 失败: {e}。返回 False。")
+        return False
     _, thresh_img = cv2.threshold(abs_diff_img,
                                   DEFAULT_CONTOUR_PIXEL_THRESHOLD,
                                   255,
                                   cv2.THRESH_BINARY)
 
-    kernel = np.ones(DEFAULT_CONTOUR_KERNEL_SIZE, np.uint8)
     dilated_thresh_img = cv2.dilate(thresh_img,
-                                    kernel,
+                                    CONTOUR_KERNEL,
                                     iterations=DEFAULT_CONTOUR_DILATION_ITERATIONS)
 
     contours, _ = cv2.findContours(dilated_thresh_img,
@@ -386,9 +756,14 @@ def are_frames_similar(frame1: np.ndarray | None,
         # logger.info(f"are_frames_similar: 差异率超标{contour_area_actual_diff_rate_percent:.4f}%，判定为不相似 (False)。")
         return False
 
-def process_and_save_frame(frame_data, effective_fourcc, base_save_dir, jpeg_quality_val, ts_format): # Identical to v2.0.0
-    global consecutive_imwrite_failures # MODIFICATION v2.0.1
-    global last_significant_frame
+def process_and_save_frame(state: 'ServiceState', frame_data, effective_fourcc, base_save_dir, jpeg_quality_val, ts_format):
+    """处理一帧图像并尝试保存。
+
+    - 必要时做色彩空间转换/灰度转 BGR
+    - 与上一显著帧比较，相似则跳过保存
+    - 添加时间戳，按照年月/日分目录保存
+    - 失败计数进入 state，不抛异常
+    """
 
     if frame_data is None:
         logger.error("接收到空帧，无法处理。")
@@ -431,8 +806,16 @@ def process_and_save_frame(frame_data, effective_fourcc, base_save_dir, jpeg_qua
         logger.warning(f"图像格式未知或非预期 (shape: {processed_frame.shape}). 尝试直接处理。")
 
     # 判断是否接近，如果和上一次成功保存类似则直接跳过
+    # 使用上一显著帧的副本，避免被后续时间戳叠加修改
+    prev_sig_frame = None
+    try:
+        if isinstance(state.last_significant_frame, np.ndarray):
+            prev_sig_frame = state.last_significant_frame.copy()
+    except Exception:
+        prev_sig_frame = state.last_significant_frame
+
     frames_are_indeed_similar = are_frames_similar(
-        last_significant_frame,
+        prev_sig_frame,
         processed_frame,
         SIMILARITY_THRESHOLD_PERCENT_INT
     )
@@ -443,10 +826,14 @@ def process_and_save_frame(frame_data, effective_fourcc, base_save_dir, jpeg_qua
     else:
         # if logger: logger.info(f"当前帧与上一显著帧不相似 (差异 > {SIMILARITY_THRESHOLD_PERCENT_INT/100.0:.2f}%)，将保存。")
         perform_save_this_frame = True
-        last_significant_frame = processed_frame
+        # 保存未加时间戳前的帧，以避免时间戳影响相似度判断
+        try:
+            state.last_significant_frame = processed_frame.copy() if isinstance(processed_frame, np.ndarray) else processed_frame
+        except Exception:
+            state.last_significant_frame = processed_frame
 
     try:
-        frame_with_timestamp = add_timestamp_to_frame(processed_frame.copy(), ts_format)
+        frame_with_timestamp = add_timestamp_to_frame(processed_frame, ts_format)
     except Exception as e:
         logger.error(f"添加时间戳失败: {e}. 将保存不带时间戳的图像。", exc_info=True)
         frame_with_timestamp = processed_frame
@@ -455,11 +842,24 @@ def process_and_save_frame(frame_data, effective_fourcc, base_save_dir, jpeg_qua
     save_subdir = os.path.join(base_save_dir, now.strftime("%Y-%m"), now.strftime("%d"))
     
     try:
-        os.makedirs(save_subdir, exist_ok=True) 
+        if not os.path.isdir(save_subdir):
+            os.makedirs(save_subdir, exist_ok=True)
     except OSError as e:
-        logger.error(f"创建目录 {save_subdir} 失败: {e}. 无法保存图像。")
-        consecutive_imwrite_failures +=1 # MODIFICATION v2.0.1
-        return None
+        logger.error(f"创建目录 {save_subdir} 失败: {e}。")
+        # 尝试回退目录
+        if IMAGE_SAVE_FALLBACK_DIR:
+            try:
+                fallback_subdir = os.path.join(IMAGE_SAVE_FALLBACK_DIR, now.strftime("%Y-%m"), now.strftime("%d"))
+                os.makedirs(fallback_subdir, exist_ok=True)
+                save_subdir = fallback_subdir
+                logger.warning(f"使用回退保存目录: {save_subdir}")
+            except OSError as e_fb:
+                logger.error(f"创建回退目录失败: {e_fb}。无法保存图像。")
+                state.consecutive_imwrite_failures += 1
+                return None
+        else:
+            state.consecutive_imwrite_failures += 1
+            return None
 
     #time_str = now.strftime("%H%M%S_%f") 
     #filename = f"{time_str}.jpg" 
@@ -473,24 +873,42 @@ def process_and_save_frame(frame_data, effective_fourcc, base_save_dir, jpeg_qua
         save_success = cv2.imwrite(filepath, frame_with_timestamp, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality_val])
         if save_success:
             logger.debug(f"图像成功保存为JPEG: {filepath}")
-            consecutive_imwrite_failures = 0 # MODIFICATION v2.0.1: Reset on success
+            state.consecutive_imwrite_failures = 0
             try:
                 os.chmod(filepath, 0o644) 
                 logger.debug(f"文件权限设置为 644: {filepath}")
             except OSError as e:
                 logger.warning(f"设置文件 {filepath} 权限失败: {e}")
+            # 可选：最小 JPEG 文件大小检查
+            if MIN_JPEG_SAVE_SIZE_BYTES and MIN_JPEG_SAVE_SIZE_BYTES > 0:
+                try:
+                    actual_size = os.path.getsize(filepath)
+                except OSError as e_sz:
+                    logger.error(f"读取文件大小失败: {e_sz}")
+                    actual_size = 0
+                if actual_size < MIN_JPEG_SAVE_SIZE_BYTES:
+                    try:
+                        os.remove(filepath)
+                    except OSError:
+                        pass
+                    logger.error(
+                        f"JPEG 文件过小({actual_size}B < {MIN_JPEG_SAVE_SIZE_BYTES}B)，判定为失败。"
+                    )
+                    state.consecutive_imwrite_failures += 1
+                    return None
             return filepath
         else:
             logger.error(f"cv2.imwrite 保存JPEG图像失败 (返回False): {filepath}")
-            consecutive_imwrite_failures +=1 # MODIFICATION v2.0.1
+            state.consecutive_imwrite_failures += 1
             return None
     except Exception as e:
         logger.error(f"cv2.imwrite 保存图像时发生异常: {e}", exc_info=True)
-        consecutive_imwrite_failures +=1 # MODIFICATION v2.0.1
+        state.consecutive_imwrite_failures += 1
         return None
 
 # --- Disk Space Management ---
 def get_oldest_day_dir(base_dir: str) -> str | None: # Identical to v2.0.0
+    """在以 YYYY-MM/DD 组织的目录结构下，找到最老的日期目录路径。"""
     all_day_paths = []
     if not os.path.isdir(base_dir):
         logger.warning(f"get_oldest_day_dir: Base directory '{base_dir}' not found or not a directory.")
@@ -512,15 +930,16 @@ def get_oldest_day_dir(base_dir: str) -> str | None: # Identical to v2.0.0
     return None
 
 def check_and_manage_disk_space(): # Identical to v2.0.0 logic
+    """检查磁盘占用并在超过阈值时删除最旧日期目录（批量）。"""
     try:
         usage = shutil.disk_usage(IMAGE_STORAGE_MONITOR_PATH)
         percent_used = (usage.used / usage.total) * 100
-        logger.info(f"磁盘空间监控: {IMAGE_STORAGE_MONITOR_PATH} - Total: {usage.total // (1024**3)}GB, "
+        logger.info(f"[DISK] 监控: {IMAGE_STORAGE_MONITOR_PATH} - Total: {usage.total // (1024**3)}GB, "
                     f"Used: {usage.used // (1024**3)}GB ({percent_used:.1f}%), "
                     f"Free: {usage.free // (1024**3)}GB")
 
         if percent_used > IMAGE_STORAGE_MAX_USAGE_PERCENT:
-            logger.warning(f"磁盘使用率 ({percent_used:.1f}%) 已超过阈值 ({IMAGE_STORAGE_MAX_USAGE_PERCENT}%). "
+            logger.warning(f"[DISK] 使用率 ({percent_used:.1f}%) 超阈值 ({IMAGE_STORAGE_MAX_USAGE_PERCENT}%). "
                            f"尝试清理 {IMAGE_STORAGE_CLEANUP_BATCH_DAYS} 个最旧的日期目录...")
             
             for i in range(IMAGE_STORAGE_CLEANUP_BATCH_DAYS):
@@ -530,23 +949,24 @@ def check_and_manage_disk_space(): # Identical to v2.0.0 logic
                 
                 oldest_dir_to_delete = get_oldest_day_dir(IMAGE_SAVE_BASE_DIR)
                 if oldest_dir_to_delete:
-                    logger.warning(f"准备删除最旧的日期目录 ({i+1}/{IMAGE_STORAGE_CLEANUP_BATCH_DAYS}): {oldest_dir_to_delete}")
+                    logger.warning(f"[DISK] 准备删除最旧日期目录 ({i+1}/{IMAGE_STORAGE_CLEANUP_BATCH_DAYS}): {oldest_dir_to_delete}")
                     try:
                         shutil.rmtree(oldest_dir_to_delete)
-                        logger.info(f"已成功删除目录: {oldest_dir_to_delete}")
+                        logger.info(f"[DISK] 已删除目录: {oldest_dir_to_delete}")
                     except OSError as e:
                         logger.error(f"删除目录 {oldest_dir_to_delete} 失败: {e}", exc_info=True)
                         break 
                 else:
-                    logger.warning("没有找到可以删除的旧日期目录。")
+                    logger.warning("[DISK] 无可删除的旧日期目录。")
                     break 
     except FileNotFoundError:
-        logger.error(f"磁盘空间监控路径 {IMAGE_STORAGE_MONITOR_PATH} 未找到。")
+        logger.error(f"[DISK] 监控路径不存在: {IMAGE_STORAGE_MONITOR_PATH}")
     except Exception as e:
-        logger.error(f"检查或管理磁盘空间时发生错误: {e}", exc_info=True)
+        logger.error(f"[DISK] 检查/清理异常: {e}", exc_info=True)
 
 # --- Get Current Capture Interval ---
-def get_current_capture_interval() -> int: # Identical to v2.0.0
+def get_current_capture_interval() -> float: # support sub-second intervals like 2.5s
+    """根据时间表返回当前拍摄间隔（秒，float）。"""
     now_time = datetime.now().time()
     for schedule_item in CAPTURE_SCHEDULE_CONFIG:
         if now_time < schedule_item["end_time_exclusive"]:
@@ -555,19 +975,21 @@ def get_current_capture_interval() -> int: # Identical to v2.0.0
 
 # --- Main Service Logic ---
 def run_capture_service():
-    global shutdown_event, cap, effective_fourcc # cap and effective_fourcc might be better as instance vars if this were a class
-    global consecutive_imwrite_failures, consecutive_read_failures # MODIFICATION v2.0.1
-    global last_significant_frame
-    last_significant_frame = None # 确保服务启动时重置
+    """图像采集主循环：自恢复，不退出。
 
-    cap = None # Ensure cap is defined in this scope
+    - 按时间表控制间隔
+    - 设备失联/读帧失败/写盘失败均有退避与重试
+    - 周期性心跳输出健康指标
+    """
+    global shutdown_event
+
+    state = ServiceState()
+    cap = None
     effective_fourcc = "NOT_SET_INITIALLY"
     init_failures = 0
-    last_disk_check_time = 0
-    consecutive_imwrite_failures = 0 # Reset counters at service start
-    consecutive_read_failures = 0
+    last_disk_check_time = 0.0
 
-    logger.debug(f"图像捕获服务主逻辑启动。")
+    logger.debug(f"[SERVICE] 主循环启动。")
     # ... (logging of schedule, camera target etc. from v2.0.0)
     logger.info(f"  时间表: " + ", ".join([f"<{s['end_time_exclusive'].strftime('%H:%M')} ({s['interval_seconds']}s)" for s in CAPTURE_SCHEDULE_CONFIG]) + 
                 f", >=22:00 ({DEFAULT_INTERVAL_LATE_NIGHT}s)")
@@ -588,7 +1010,7 @@ def run_capture_service():
                 last_disk_check_time = current_monotonic_time
 
             if cap is None or not cap.isOpened():
-                logger.info("摄像头未连接或需要重新初始化...")
+                logger.info("[CAMERA] 未连接或需要重新初始化...")
                 if cap: cap.release() 
                 
                 cap, effective_fourcc = initialize_camera(
@@ -607,7 +1029,13 @@ def run_capture_service():
                 
                 init_failures = 0 
                 last_capture_time = time.monotonic() 
-                consecutive_read_failures = 0 # Reset read failure counter on successful init
+                state.consecutive_read_failures = 0
+                state.effective_fourcc = effective_fourcc
+                # 记录当次应用的相机请求参数，用于后续热重载是否需要重建
+                state.applied_camera_device = DEFAULT_CAMERA_DEVICE_PATH
+                state.applied_width = DEFAULT_WIDTH
+                state.applied_height = DEFAULT_HEIGHT
+                state.applied_requested_fourcc = REQUESTED_FOURCC
 
             elapsed_since_last_capture = time.monotonic() - last_capture_time
             wait_time = current_interval - elapsed_since_last_capture
@@ -620,72 +1048,177 @@ def run_capture_service():
             if shutdown_event.is_set(): break 
 
             last_capture_time = time.monotonic() 
-            logger.debug(f"尝试捕获图像帧 (当前间隔: {current_interval}s)...")
+            logger.debug(f"[CAPTURE] 尝试捕获图像帧 (间隔: {current_interval}s)...")
 
             for _ in range(4):
                 # 清空缓冲帧
                 cap.grab();
-            ret, frame = cap.read()
+            t0 = time.perf_counter()
+            try:
+                ret, frame = cap.read()
+            except Exception as e:
+                logger.error(f"读取图像帧异常: {e}")
+                ret, frame = False, None
 
             if not ret or frame is None:
-                logger.error("无法从摄像头获取图像帧。摄像头可能已断开连接或出现问题。")
-                consecutive_read_failures += 1 # MODIFICATION v2.0.1
-                logger.info(f"连续读帧失败次数: {consecutive_read_failures}")
+                # 节流日志，减少重复 I/O
+                if state.consecutive_read_failures % LOG_EVERY_N_READ_FAILURES == 0:
+                    logger.error("[CAPTURE] 无法从摄像头获取图像帧，可能断开或异常。")
+                state.consecutive_read_failures += 1
+                if state.consecutive_read_failures % LOG_EVERY_N_READ_FAILURES == 0:
+                    logger.info(f"[CAPTURE] 连续读帧失败次数: {state.consecutive_read_failures}")
                 if cap: cap.release()
                 cap = None 
                 
-                if consecutive_read_failures >= MAX_CONSECUTIVE_READ_FAILURES:
-                    logger.critical(f"已连续 {consecutive_read_failures} 次无法读取帧。将等待较长时间 ({READ_FAILURE_LONG_BACKOFF_SECONDS}s) 后尝试重连。")
+                if state.consecutive_read_failures >= MAX_CONSECUTIVE_READ_FAILURES:
+                    logger.critical(f"已连续 {state.consecutive_read_failures} 次无法读取帧。将等待较长时间 ({READ_FAILURE_LONG_BACKOFF_SECONDS}s) 后尝试重连。")
                     shutdown_event.wait(READ_FAILURE_LONG_BACKOFF_SECONDS)
-                    consecutive_read_failures = 0 # Reset after long backoff
+                    state.consecutive_read_failures = 0
                 else:
                     shutdown_event.wait(FRAME_READ_ERROR_RETRY_DELAY_SECONDS) 
                 continue
             
-            consecutive_read_failures = 0 # Reset on successful read MODIFICATION v2.0.1
+            state.consecutive_read_failures = 0
 
-            saved_filepath = process_and_save_frame(
-                frame, effective_fourcc, IMAGE_SAVE_BASE_DIR, 
-                JPEG_SAVE_QUALITY, TIMESTAMP_FORMAT
-            )
+            try:
+                saved_filepath = process_and_save_frame(
+                    state, frame, effective_fourcc, IMAGE_SAVE_BASE_DIR, 
+                    JPEG_SAVE_QUALITY, TIMESTAMP_FORMAT
+                )
+            except Exception as e:
+                logger.error(f"处理与保存帧异常: {e}", exc_info=True)
+                saved_filepath = None
             if saved_filepath == "SIMILARITY":
-                logger.debug("图像接近，跳过保存")
+                logger.debug("[SAVE] 图像接近，跳过保存")
             elif isinstance(saved_filepath, str) and saved_filepath.lower().endswith(".jpg"):
-                logger.debug(f"图像捕获并成功保存: {saved_filepath}")
+                logger.debug(f"[SAVE] 成功保存: {saved_filepath}")
                 # consecutive_imwrite_failures is reset inside process_and_save_frame
+                state.last_saved_filepath = saved_filepath
             else:
-                logger.warning("本次图像捕获未能成功保存。")
+                logger.warning("[SAVE] 本次图像未能成功保存。")
                 # consecutive_imwrite_failures is incremented inside process_and_save_frame
-                if consecutive_imwrite_failures >= MAX_CONSECUTIVE_IMWRITE_FAILURES:
-                    logger.critical(f"已连续 {consecutive_imwrite_failures} 次无法保存图像到磁盘。服务将停止。")
-                    shutdown_event.set() # Signal shutdown
-                    break # Exit while loop
+                if state.consecutive_imwrite_failures >= MAX_CONSECUTIVE_IMWRITE_FAILURES:
+                    logger.critical(f"[SAVE] 连续 {state.consecutive_imwrite_failures} 次保存失败，尝试磁盘清理并退避后继续。")
+                    try:
+                        check_and_manage_disk_space()
+                        state.total_disk_cleanup_batches += IMAGE_STORAGE_CLEANUP_BATCH_DAYS
+                    except Exception as e_clean:
+                        logger.error(f"执行磁盘清理时异常: {e_clean}")
+                    shutdown_event.wait(IMWRITE_FAILURE_BACKOFF_SECONDS)
+                    state.consecutive_imwrite_failures = 0
+                    continue
+
+            # 记录耗时
+            t1 = time.perf_counter()
+            elapsed_ms = (t1 - t0) * 1000.0
+            # 控制滑动窗口规模，避免无限增长
+            state.processing_times_ms.append(elapsed_ms)
+
+            # 心跳日志：定期打印运行健康信息
+            now_mono = time.monotonic()
+            if now_mono - state.last_heartbeat_monotonic >= HEARTBEAT_INTERVAL_SECONDS:
+                log_heartbeat(state, current_interval)
+                state.last_heartbeat_monotonic = now_mono
+
+            # 健康快照：周期性输出 JSON 文件，供外部探针读取
+            try:
+                if now_mono - state.last_health_dump_monotonic >= HEARTBEAT_INTERVAL_SECONDS:
+                    health = {
+                        "boot_id": state.boot_id,
+                        "ts": time.time(),
+                        "interval": current_interval,
+                        "read_failures": state.consecutive_read_failures,
+                        "imwrite_failures": state.consecutive_imwrite_failures,
+                        "disk_cleanup_batches": state.total_disk_cleanup_batches,
+                        "last_saved": state.last_saved_filepath,
+                        "fourcc": state.effective_fourcc,
+                    }
+                    health_path = os.path.join(LOG_DIR, "health.json")
+                    with open(health_path, "w", encoding="utf-8") as hf:
+                        json.dump(health, hf, ensure_ascii=False)
+                    state.last_health_dump_monotonic = now_mono
+            except Exception:
+                # 健康文件输出失败不影响主流程
+                pass
+
+            # 配置热重载：若关键相机参数发生变化，则触发安全重建
+            if CONFIG_ENABLED and reload_event.is_set():
+                try:
+                    logger.info("执行配置热重载...")
+                    prev_device = DEFAULT_CAMERA_DEVICE_PATH
+                    prev_w, prev_h = DEFAULT_WIDTH, DEFAULT_HEIGHT
+                    prev_fourcc = REQUESTED_FOURCC
+                    load_and_apply_yaml_config(CONFIG_PATH, runtime_reload=True)
+                    logger.info("配置热重载完成。")
+
+                    # 检查是否需要重建相机：设备路径、分辨率或 FOURCC 发生变化
+                    need_reopen = False
+                    if (state.applied_camera_device and DEFAULT_CAMERA_DEVICE_PATH != state.applied_camera_device) or \
+                       (state.applied_width and DEFAULT_WIDTH != state.applied_width) or \
+                       (state.applied_height and DEFAULT_HEIGHT != state.applied_height) or \
+                       (state.applied_requested_fourcc and REQUESTED_FOURCC.upper() != state.applied_requested_fourcc.upper()):
+                        need_reopen = True
+
+                    if need_reopen:
+                        logger.info("[CAMERA] 检测到关键参数变化，安全重建摄像头 (device/size/fourcc)")
+                        try:
+                            if cap:
+                                cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+                        # 立即重新初始化（不等待下一轮）
+                        cap, effective_fourcc = initialize_camera(
+                            DEFAULT_CAMERA_DEVICE_PATH, DEFAULT_WIDTH, DEFAULT_HEIGHT, REQUESTED_FOURCC
+                        )
+                        if cap:
+                            state.effective_fourcc = effective_fourcc
+                            state.applied_camera_device = DEFAULT_CAMERA_DEVICE_PATH
+                            state.applied_width = DEFAULT_WIDTH
+                            state.applied_height = DEFAULT_HEIGHT
+                            state.applied_requested_fourcc = REQUESTED_FOURCC
+                            last_capture_time = time.monotonic()
+                            logger.info("[CAMERA] 重建完成，新的有效 FOURCC: %s", effective_fourcc)
+                        else:
+                            logger.error("[CAMERA] 重建失败，将进入正常重试路径")
+                except Exception as e:
+                    logger.error(f"热重载失败: {e}")
+                finally:
+                    reload_event.clear()
 
         except cv2.error as e: 
-            logger.error(f"主循环中发生 OpenCV 特定错误: {e}", exc_info=True)
-            if cap: cap.release()
+            # 不退出，自恢复
+            logger.error(f"[SERVICE] OpenCV 异常: {e}", exc_info=True)
+            try:
+                if cap: cap.release()
+            except Exception:
+                pass
             cap = None
-            logger.info(f"因 OpenCV 错误，将等待 {CAMERA_INIT_RETRY_DELAY_SECONDS}s 后尝试重启摄像头。")
+            logger.info(f"[SERVICE] 因 OpenCV 错误，等待 {CAMERA_INIT_RETRY_DELAY_SECONDS}s 后重试。")
             shutdown_event.wait(CAMERA_INIT_RETRY_DELAY_SECONDS)
         except Exception as e: 
-            logger.critical(f"主循环中发生未预料的严重错误: {e}", exc_info=True)
-            if cap: cap.release() 
+            # 不退出，自恢复
+            logger.critical(f"[SERVICE] 未预料的严重错误: {e}", exc_info=True)
+            try:
+                if cap: cap.release() 
+            except Exception:
+                pass
             cap = None
-            logger.info(f"因严重错误，将等待 {CAMERA_INIT_LONG_BACKOFF_SECONDS}s 后尝试重启摄像头。")
+            logger.info(f"[SERVICE] 因严重错误，等待 {CAMERA_INIT_LONG_BACKOFF_SECONDS}s 后重试。")
             shutdown_event.wait(CAMERA_INIT_LONG_BACKOFF_SECONDS)
-            # Consider uncommenting 'raise' for systemd to handle restart on truly unrecoverable errors
-            # raise
 
     # Loop exited (likely due to shutdown_event)
     if cap and cap.isOpened():
-        logger.info("正在释放摄像头资源...")
+        logger.info("[CAMERA] 正在释放资源...")
         cap.release()
-    logger.info("图像捕获服务主逻辑已停止。")
+    logger.info("[SERVICE] 主循环已停止。")
 
 
 # --- Main Application Entry Point & CLI Argument Parsing ---
 def main():
-    global logger, PID_FILE_PATH # Allow modification if args change them
+    """命令行入口：解析参数、初始化日志、可选加载配置并运行服务。"""
+    global logger, PID_FILE_PATH, CONFIG_PATH, CONFIG_ENABLED # Allow modification if args change them
+    global LOG_DIR, IMAGE_SAVE_BASE_DIR, IMAGE_STORAGE_MONITOR_PATH
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Image Capture Service (v{SCRIPT_VERSION})")
     parser.add_argument('action', nargs='?', choices=['start', 'stop', 'status', 'foreground'], 
@@ -696,24 +1229,68 @@ def main():
     parser.add_argument('--logdir', default=LOG_DIR, help=f"Path to log directory (default: {LOG_DIR})")
     parser.add_argument('--loglevel', default=LOG_LEVEL_CONFIG, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help=f"Logging level (default: {LOG_LEVEL_CONFIG})")
+    parser.add_argument('--config', default=CONFIG_PATH, help="Path to YAML config file (optional)")
+    parser.add_argument('--use-config', action='store_true', help="Enable loading YAML config (default: disabled)")
     # For true daemonization with python-daemon, more args like --user, --group, --working-directory would be needed.
     # For now, 'start' is conceptual if not using systemd or a proper daemon library.
 
     args = parser.parse_args()
     
-    PID_FILE_PATH = os.path.abspath(args.pidfile)
-    # Initialize logging system (now that PID_FILE_PATH for potential log inside pid dir is known)
+    # Resolve writable directories with fallbacks (do not crash on permission issues)
+    home_dir = os.path.expanduser('~') or '/tmp'
+    resolved_log_dir = args.logdir
     try:
-        os.makedirs(args.logdir, exist_ok=True)
-        # Also ensure image save base dir exists before service starts trying to write into it.
-        if not os.path.exists(IMAGE_SAVE_BASE_DIR): # This check should ideally use an absolute path too
-            os.makedirs(IMAGE_SAVE_BASE_DIR, exist_ok=True)
-    except OSError as e:
-        # If using print before logger is initialized
-        print(f"CRITICAL: Failed to create essential directories (Log dir: {args.logdir} or Image Base: {IMAGE_SAVE_BASE_DIR}): {e}", file=sys.stderr)
-        sys.exit(1)
-    logger = setup_logging_system(args.logdir, LOG_FILE_NAME, args.loglevel.upper(), 
+        os.makedirs(resolved_log_dir, exist_ok=True)
+    except Exception:
+        resolved_log_dir = os.path.join(home_dir, 'camera', 'logs')
+        os.makedirs(resolved_log_dir, exist_ok=True)
+
+    # Image save dir may be overridden later by YAML; init with current value
+    resolved_image_dir = IMAGE_SAVE_BASE_DIR
+    try:
+        os.makedirs(resolved_image_dir, exist_ok=True)
+    except Exception:
+        resolved_image_dir = os.path.join(home_dir, 'camera', 'captures')
+        os.makedirs(resolved_image_dir, exist_ok=True)
+
+    logger = setup_logging_system(resolved_log_dir, LOG_FILE_NAME, args.loglevel.upper(), 
                                   LOG_ROTATE_WHEN, LOG_ROTATE_INTERVAL, LOG_ROTATE_BACKUP_COUNT)
+
+    # Apply YAML config overrides only when explicitly enabled
+    # 更新全局配置路径与开关（用于热重载）
+    CONFIG_PATH = args.config
+    CONFIG_ENABLED = bool(args.use_config)
+    if CONFIG_ENABLED:
+        load_and_apply_yaml_config(args.config)
+
+    # After YAML overrides, re-ensure dirs
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except Exception:
+        LOG_DIR = resolved_log_dir
+    try:
+        os.makedirs(IMAGE_SAVE_BASE_DIR, exist_ok=True)
+    except Exception:
+        IMAGE_SAVE_BASE_DIR = resolved_image_dir
+    global IMAGE_STORAGE_MONITOR_PATH
+    IMAGE_STORAGE_MONITOR_PATH = IMAGE_SAVE_BASE_DIR
+
+    # Resolve PID file path with fallback if not writable
+    pid_dir = os.path.dirname(os.path.abspath(args.pidfile))
+    try:
+        os.makedirs(pid_dir, exist_ok=True)
+        PID_FILE_PATH = os.path.abspath(args.pidfile)
+    except Exception:
+        PID_FILE_PATH = os.path.join('/tmp', os.path.basename(args.pidfile))
+
+    # 统一输出一次运行配置概览（方便问题定位）
+    try:
+        logger.info(
+            "[BOOT] config_enabled=%s, config_path='%s', image_dir='%s', log_dir='%s', device='%s', size=%dx%d, fourcc='%s', jpeg_quality=%d",
+            str(CONFIG_ENABLED), CONFIG_PATH, IMAGE_SAVE_BASE_DIR, LOG_DIR, DEFAULT_CAMERA_DEVICE_PATH, DEFAULT_WIDTH, DEFAULT_HEIGHT, REQUESTED_FOURCC, JPEG_SAVE_QUALITY
+        )
+    except Exception:
+        pass
 
     # Handle actions
     if args.action == 'start' or args.action == 'foreground':
@@ -741,6 +1318,12 @@ def main():
         create_pid_file()
         signal.signal(signal.SIGTERM, signal_term_handler)
         signal.signal(signal.SIGINT, signal_term_handler) 
+        # 支持 SIGHUP 触发配置热重载
+        try:
+            signal.signal(signal.SIGHUP, signal_hup_handler)
+        except Exception:
+            # Windows 或不支持 SIGHUP 的平台忽略
+            pass
 
         try:
             run_capture_service() 
@@ -759,6 +1342,7 @@ def main():
         if not os.path.exists(PID_FILE_PATH):
             logger.warning(f"PID file {PID_FILE_PATH} not found. Service may not be running.")
             sys.exit(1) # Changed to 1 as "not running" is often a failure for "stop"
+        terminated_successfully = False
         try:
             with open(PID_FILE_PATH, 'r') as f:
                 pid = int(f.read().strip())

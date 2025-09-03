@@ -21,6 +21,7 @@ StartLimitBurst=5         # 最多尝试重启5次，防止无限重启循环
 
 # ---- 日志和环境 ----
 Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONDONTWRITEBYTECODE=1"
 StandardOutput=journal # 将Python脚本的stdout重定向到systemd journal
 StandardError=journal  # 将Python脚本的stderr重定向到systemd journal
 SyslogIdentifier=armbian-camera-capture
@@ -36,6 +37,7 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX # 根据需要调整，如果只用本地设备，AF_UNIX可能就够了
 RestrictRealtime=true
+UMask=0027
 
 # 限制权限提升
 NoNewPrivileges=true
@@ -59,6 +61,9 @@ CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_SYS_BOOT C
 
 # ---- 超时设置 ----
 TimeoutStopSec=30s        # 优雅停止的超时时间 (默认90s)
+ReadWritePaths=/opt/camera/captures /opt/camera/logs /var/run
+ReadOnlyPaths=/opt/camera
+InaccessiblePaths=/home /root /etc /usr /bin /sbin /lib
 
 [Install]
 WantedBy=multi-user.target
