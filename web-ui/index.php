@@ -1,3 +1,15 @@
+<?php
+require_once 'config.php';
+if (!check_authentication()) {
+    header('Location: login.php?error=unauthorized');
+    exit;
+}
+// 注入 CSRF Token 到前端（容错）
+$__csrf = '';
+if (function_exists('get_csrf_token')) {
+    try { $__csrf = get_csrf_token(); } catch (Exception $e) { $__csrf = ''; } catch (Error $e) { $__csrf = ''; }
+}
+?>
 <!DOCTYPE html>
 <html lang="zh-CN">
     <head>
@@ -5,6 +17,9 @@
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>照片查看器</title>
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" />
+        <script>
+            window.__CSRF_TOKEN__ = '<?php echo $__csrf; ?>';
+        </script>
         <style>
             /* --- CSS Variables for Theming --- */
             :root {
@@ -77,15 +92,38 @@
                 --slideshow-close-hover-color-dark: #e5e7eb;
             }
 
+            html {
+                background: radial-gradient(1200px 800px at 20% -10%, rgba(14,165,233,.25), transparent),
+                            radial-gradient(1000px 700px at 120% 20%, rgba(59,130,246,.25), transparent),
+                            linear-gradient(180deg, #eef2ff 0%, var(--main-bg-color) 100%);
+                background-repeat: no-repeat, no-repeat, no-repeat;
+                min-height: 100%;
+            }
+            html.dark-theme, body.dark-theme html { /* 兼容性兜底，不依赖此选择器 */ }
             body {
                 background-color: var(--main-bg-color);
                 color: var(--text-color-primary);
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
                 margin: 0;
-                padding: 15px;
+                padding: 15px 15px 32px; /* 增加底部填充，避免底部露底 */
                 line-height: 1.6;
                 font-size: 16px;
+                /* 与登录页一致的柔和渐变背景（浅色） */
+                background: radial-gradient(1200px 800px at 20% -10%, rgba(14,165,233,.25), transparent),
+                            radial-gradient(1000px 700px at 120% 20%, rgba(59,130,246,.25), transparent),
+                            linear-gradient(180deg, #eef2ff 0%, var(--main-bg-color) 100%);
+                /* 优化：去除固定与强制尺寸，避免大屏/长页出现分割线 */
+                background-repeat: no-repeat, no-repeat, no-repeat;
             }
+            /* 深色主题背景，与登录页一致 */
+            body.dark-theme, html.dark-theme {
+                background: radial-gradient(1200px 800px at 20% -10%, rgba(59,130,246,.25), transparent),
+                            radial-gradient(1000px 700px at 120% 20%, rgba(14,165,233,.2), transparent),
+                            linear-gradient(180deg, #0b1220 0%, #0b1220 30%, var(--main-bg-color) 100%);
+                background-repeat: no-repeat, no-repeat, no-repeat;
+                background-color: #0b1220; /* 深色兜底，防止空白 */
+            }
+            html, body { min-height: 100vh; background-color: var(--main-bg-color); }
             .container {
                 background: var(--container-bg-color);
                 max-width: 1700px;
@@ -257,6 +295,7 @@
                 text-align: center;
                 padding: 20px;
                 border-radius: 8px;
+                position: relative;
             }
             #monitorImage {
                 max-width: 90%;
@@ -266,6 +305,19 @@
                 margin-bottom: 10px;
                 background-color: var(--container-bg-color);
             }
+            /* 监控最大化时，放开 #monitorImage 的限制，按照视口尽可能放大 */
+            .lightbox-image-container.maximized #monitorImage {
+                width: auto;
+                height: auto;
+                max-width: calc(100vw - 64px);
+                max-height: calc(100vh - 64px);
+            }
+            /* 监控视图的控制按钮，复用与图片查看一致的布局 */
+            #monitoringSection .lightbox-image-container { position: relative; }
+            #monitoringSection .image-controls { position: absolute; top: 16px; right: 16px; display: flex; gap: 8px; z-index: 1010; }
+            #monitoringSection .image-controls button { width: 36px; height: 36px; border: none; border-radius: 10px; background: rgba(0,0,0,.55); color: #fff; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background-color .2s ease, transform .05s ease; }
+            #monitoringSection .image-controls button:hover { background: rgba(0,0,0,.7); }
+            #monitoringSection .image-controls button:active { transform: translateY(1px); }
             #monitorFilename,
             #monitorTimestamp {
                 font-size: 0.95em;
@@ -413,41 +465,39 @@
                 margin: 20px;
             }
             .lightbox-image-container {
-                flex: 1;
-                width: 100%;
-                min-height: 0;
+                position: relative;
                 display: flex;
                 align-items: center;
                 justify-content: center;
                 margin: 10px 0;
                 overflow: hidden;
-                position: relative;
             }
             .lightbox-image {
-                max-width: 100%;
-                max-height: calc(75vh - 200px);
-                object-fit: contain;
-                height: auto;
                 display: block;
+                height: auto;
+                max-width: 100%;
+                max-height: 75vh;
+                object-fit: contain;
                 margin: 0;
                 border-radius: 4px;
             }
-            .maximize-btn {
+            /* 单独用于监控画面的最大化按钮（直接作为容器子元素） */
+            .lightbox-image-container > .maximize-btn {
                 position: absolute;
-                top: 15px;
-                right: 15px;
-                background-color: rgba(0, 0, 0, 0.5);
+                top: 16px;
+                right: 16px;
+                background-color: rgba(0, 0, 0, 0.55);
                 color: white;
                 border: none;
-                border-radius: 50%;
-                width: 30px;
-                height: 30px;
+                border-radius: 10px;
+                width: 36px;
+                height: 36px;
                 cursor: pointer;
                 z-index: 1010;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                transition: background-color 0.3s ease;
+                transition: background-color 0.2s ease, transform 0.05s ease;
                 padding: 0;
             }
             .maximize-btn svg {
@@ -455,14 +505,7 @@
                 height: 16px;
                 fill: currentColor;
             }
-            .lightbox-image-container.maximized .lightbox-close {
-                top: 170px;
-                right: 90px;
-            }
-            .lightbox-image-container.maximized .maximize-btn {
-                top: 170px;
-                right: 35px;
-            }
+            .maximize-btn:active { transform: translateY(1px); }
             .lightbox-details-container {
                 width: 100%;
                 overflow-y: auto;
@@ -551,9 +594,19 @@
                 color: white !important;
                 border: none;
             }
+            /* 当关闭按钮位于 image-controls 内时，使用统一布局与尺寸，保持与其他按钮同高对齐 */
+            .image-controls .lightbox-close {
+                position: static;
+                right: auto;
+                top: auto;
+                width: 36px;
+                height: 36px;
+                border-radius: 10px;
+                background-color: rgba(0, 0, 0, 0.55);
+            }
             .lightbox-close svg {
-                width: 16px;
-                height: 16px;
+                width: 18px;
+                height: 18px;
                 fill: currentColor;
             }
             .lightbox-close:hover {
@@ -563,32 +616,31 @@
             /* 控制按钮容器 */
             .image-controls {
                 position: absolute;
-                top: 15px;
-                right: 15px;
+                top: 16px;
+                right: 16px;
                 display: flex;
-                gap: 10px;
+                gap: 8px;
                 z-index: 1010;
             }
 
             /* 统一按钮样式 */
             .image-controls button {
-                width: 32px;
-                height: 32px;
+                width: 36px;
+                height: 36px;
                 border: none;
-                border-radius: 50%;
-                background-color: rgba(0, 0, 0, 0.5);
+                border-radius: 10px;
+                background-color: rgba(0, 0, 0, 0.55);
                 color: white;
                 cursor: pointer;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                transition: background-color 0.3s ease;
+                transition: background-color 0.2s ease, transform 0.05s ease;
                 padding: 0;
             }
 
-            .image-controls button:hover {
-                background-color: rgba(0, 0, 0, 0.7);
-            }
+            .image-controls button:hover { background-color: rgba(0, 0, 0, 0.7); }
+            .image-controls button:active { transform: translateY(1px); }
 
             .lightbox-close {
                 font-size: 24px;
@@ -596,8 +648,8 @@
             }
 
             .maximize-btn svg {
-                width: 16px;
-                height: 16px;
+                width: 18px;
+                height: 18px;
                 fill: currentColor;
             }
 
@@ -634,8 +686,11 @@
             }
 
             .lightbox-image-container.maximized .image-controls {
-                top: 20px;
-                right: 20px;
+                position: fixed;
+                top: max(16px, env(safe-area-inset-top));
+                right: max(16px, env(safe-area-inset-right));
+                z-index: 1200;
+                pointer-events: auto;
             }
 
             @media (max-width: 575px) {
@@ -652,18 +707,22 @@
 
             .lightbox-image-container.maximized {
                 position: fixed;
-                top: 0;
-                left: 0;
-                width: 100vw;
-                height: 100vh;
+                inset: 0;
                 z-index: 1100;
                 background-color: var(--modal-overlay-bg);
                 margin: 0;
+                overflow: hidden;
+                display: flex;
+                align-items: center;
+                justify-content: center;
             }
 
             .lightbox-image-container.maximized .lightbox-image {
-                max-height: 95vh;
-                max-width: 95vw;
+                width: auto;
+                height: auto;
+                max-width: calc(100vw - 64px);
+                max-height: calc(100vh - 64px);
+                object-fit: contain;
             }
 
             #photoSlideshowModal {
@@ -674,6 +733,21 @@
                 background-color: var(--slideshow-content-bg-light);
                 color: var(--slideshow-text-color-light);
                 position: relative;
+            }
+            #photoSlideshowModal .lightbox-image-container { position: relative; display:flex; align-items:center; justify-content:center; }
+            #photoSlideshowModal .image-controls { position:absolute; top:16px; right:16px; display:flex; gap:8px; z-index:1010; }
+            #photoSlideshowModal .image-controls button { width:36px; height:36px; border:none; border-radius:10px; background:rgba(0,0,0,.55); color:#fff; display:flex; align-items:center; justify-content:center; }
+            #photoSlideshowModal .image-controls button:hover { background:rgba(0,0,0,.7); }
+            #photoSlideshowModal .lightbox-image { max-height: calc(100vh - 120px); max-width: calc(100vw - 64px); object-fit: contain; }
+            /* 更高优先级：轮播最大化时的图像尺寸（覆盖普通规则） */
+            #photoSlideshowModal .lightbox-image-container.maximized .lightbox-image {
+                max-width: calc(100vw - 64px) !important;
+                max-height: calc(100vh - 64px) !important;
+            }
+            /* 图片查看最大化时（非轮播）的图像尺寸 */
+            #lightboxModal .lightbox-image-container.maximized .lightbox-image {
+                max-width: calc(100vw - 64px) !important;
+                max-height: calc(100vh - 64px) !important;
             }
 
             body.dark-theme #photoSlideshowModal .lightbox-content-wrapper {
@@ -704,42 +778,17 @@
                 background-color: rgba(0, 0, 0, 0.7);
             }
 
-            /* 监控页面的最大化按钮单独样式 */
-            #monitoringSection .maximize-btn {
-                position: absolute;
-                top: 205px;
-                right: 94px;
-                background-color: rgba(0, 0, 0, 0.5);
-                color: white;
-                border: none;
-                border-radius: 50%;
-                width: 32px;
-                height: 32px;
-                cursor: pointer;
-                z-index: 1010;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                transition: background-color 0.3s ease;
+            /* 监控页面已切换为 image-controls 覆盖，不再单独定位 maximize-btn */
+
+            /* 当覆盖层(lightbox)打开时，隐藏底层的控制按钮，避免出现两组按钮 */
+            body.lightbox-open #monitoringSection .image-controls,
+            body.lightbox-open #photoSlideshowModal .image-controls {
+                display: none !important;
             }
 
-            /* 监控页面的最大化按钮单独样式 */
-            #monitoringSection .maximize-btn {
-                position: absolute;
-                top: 30px;
-                right: 94px;
-                background-color: rgba(0, 0, 0, 0.5);
-                color: white;
-                border: none;
-                border-radius: 50%;
-                width: 32px;
-                height: 32px;
-                cursor: pointer;
-                z-index: 1010;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                transition: background-color 0.3s ease;
+            /* 最大化后仅保留关闭按钮，隐藏最大化按钮 */
+            .lightbox-image-container.maximized .maximize-btn {
+                display: none !important;
             }
 
             #slideshowCounter {
@@ -771,7 +820,10 @@
                 <button id="startMonitorBtn" class="control-button">实时监控</button>
                 <button id="stopMonitorBtn" class="control-button">停止监控</button>
                 <button id="themeToggleBtn" class="control-button" title="切换主题">☀️</button>
-                <a href="logout.php" id="logoutButton" class="control-button">登出</a>
+                <form id="logoutForm" method="POST" action="logout.php" style="margin-left:auto;">
+                    <input type="hidden" name="csrf_token" id="logoutCsrf">
+                    <button type="submit" id="logoutButton" class="control-button" aria-label="登出">登出</button>
+                </form>
                 <div id="currentLevelInfoContainer">
                     <span id="currentLevelInfo"></span>
                 </div>
@@ -784,11 +836,14 @@
                 <h2 style="font-size: 1.2em; color: var(--text-color-primary); margin-bottom: 15px;">实时监控中...</h2>
                 <div class="lightbox-image-container">
                     <img id="monitorImage" src="" alt="实时照片" class="lightbox-image" />
-                    <button class="maximize-btn" title="最大化">
-                        <svg viewBox="0 0 24 24" class="maximize-icon">
-                            <path d="M3 3h7v2H5v5H3V3m18 0v7h-2V5h-5V3h7M3 21v-7h2v5h5v2H3m18-7v7h-7v-2h5v-5h2"/>
-                        </svg>
-                    </button>
+                    <div class="image-controls">
+                        <button class="lightbox-close" id="monitorCloseBtn" title="关闭监控" role="button" tabindex="0">
+                            <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                        </button>
+                        <button class="maximize-btn" title="最大化">
+                            <svg viewBox="0 0 24 24" class="maximize-icon"><path d="M3 3h7v2H5v5H3V3m18 0v7h-2V5h-5V3h7M3 21v-7h2v5h5v2H3m18-7v7h-7v-2h5v-5h2"/></svg>
+                        </button>
+                    </div>
                 </div>
                 <div class="lightbox-details">
                     <p><strong>文件名称:</strong> <span id="monitorFilename"></span></p>
@@ -917,14 +972,20 @@
             let isMonitoringActive = false;
             let monitorTimeoutId = null;
             let currentMonitorPhoto = { filename: "", imageUrl: "", timestampEpoch: 0, filesize: 0 };
-            const CAMERA_INTERVAL_MS = 2500; // 相机拍摄间隔，可配置（默认5秒）
-            const POLLING_OFFSET_MS = 80; // 轮询偏移量（0.15秒）
+            // 自适应轮询调度：无需预知拍摄间隔
+            let adaptiveIntervalMs = 1500; // 动态调整窗口（下限）
+            const MIN_INTERVAL_MS = 1000;
+            const MAX_INTERVAL_MS = 8000;
+            const BACKOFF_FACTOR_NO_CHANGE = 1.25; // 未产生新图时逐步退避
+            const FORWARD_FACTOR_NEW = 0.8;        // 有新图时适度加快
+            const POLLING_OFFSET_MS = 120;
             const MONITOR_RETRY_NO_NEW_PHOTO_MS = 3000;
             const MONITOR_RETRY_NO_PHOTO_AT_ALL_MS = 10000;
             let lastPollCount = 0; // 记录连续轮询次数
             let globalSlideshowItems = [];
             let globalSlideshowCurrentIndex = -1;
             let isGlobalSlideshowActive = false;
+            let overlayOrigin = null; // 'slideshow' | 'monitor' | null
 
             // --- Utility Functions ---
             function showLoading(show) {
@@ -939,16 +1000,26 @@
                     statusEl.className = "";
                 }
             }
+            // 可取消的导航类请求，避免快速切换造成的并发竞态
+            const cancellableActions = new Set(["getDailySummary", "getHourlySummary", "getTenMinuteSummary", "getMinutePhotos", "getPhotoListForRange"]);
+            const pendingRequests = new Map(); // action -> AbortController
             async function fetchData(action, params = {}) {
-                /* ... (与之前包含错误处理的版本相同) ... */ showLoading(true);
+                showLoading(true);
                 const qPO = { ...params };
                 if (currentState.date && !qPO.date && action !== "getEarliestDate" && action !== "getLatestPhoto" && action !== "getPhotoListForRange") {
                     qPO.date = currentState.date;
                 }
                 const qP = new URLSearchParams(qPO).toString();
                 const url = `gallery_api.php?action=${action}${qP ? "&" + qP : ""}`;
+                let controller = null;
                 try {
-                    const r = await fetch(url);
+                    if (cancellableActions.has(action)) {
+                        const prev = pendingRequests.get(action);
+                        if (prev) { try { prev.abort(); } catch (_) {} }
+                        controller = new AbortController();
+                        pendingRequests.set(action, controller);
+                    }
+                    const r = await fetch(url, { signal: controller ? controller.signal : undefined, credentials: 'same-origin', cache: (action === 'getLatestPhoto' ? 'no-store' : 'default') });
                     if (!r.ok) {
                         let eT = `HTTP error ${r.status} (${r.statusText})`;
                         try {
@@ -958,24 +1029,29 @@
                         throw new Error(eT);
                     }
                     const d = await r.json();
-                    if (d.error && action !== "getEarliestDate" && !(action === "getLatestPhoto" && d.latest_photo === null) && !(action === "getPhotoListForRange" && d.photos !== undefined)) {
+                    if (d && d.error && action !== "getEarliestDate" && !(action === "getLatestPhoto" && d.latest_photo === null) && !(action === "getPhotoListForRange" && d.photos !== undefined)) {
                         throw new Error(d.error);
                     }
                     return d;
                 } catch (e) {
+                    if (e && (e.name === 'AbortError' || e.message === 'The user aborted a request.')) {
+                        return null;
+                    }
                     console.error(`Workspace error for action "${action}" with params "${qP}":`, e);
-                    // Check if the error message indicates an authorization issue
                     if (e.message && e.message.includes("访问未授权或会话已超时，请重新登录")) {
-                        // Redirect to login.php
                         window.location.href = 'login.php';
-                        // It's good practice to return or throw to prevent further execution if redirecting
                         return null;
                     } else {
-                        // For any other errors, update the status as usual
                         updateStatus(`加载数据失败: ${e.message}`, true);
                     }
                     return null;
                 } finally {
+                    if (cancellableActions.has(action)) {
+                        const cur = pendingRequests.get(action);
+                        if (!cur || cur === controller) {
+                            pendingRequests.delete(action);
+                        }
+                    }
                     showLoading(false);
                 }
             }
@@ -1016,6 +1092,9 @@
                     if (item.image_url) {
                         preloadUrls.push(item.image_url);
                     }
+                    // 动态图片错误兜底
+                    const imgEl = div.querySelector('img');
+                    if (imgEl && typeof handleImageError === 'function') handleImageError(imgEl);
                     
                     // 添加渐入动画
                     setTimeout(() => {
@@ -1046,6 +1125,8 @@
                     const timePart = parts.length > 2 ? parts[2].match(/.{1,2}/g).join(":") : photo.filename;
                     const sequencePart = parts.length > 3 ? parts[3].split(".")[0] : "";
                     container.innerHTML = `<img src="${photo.image_url}" alt="${photo.filename}" title="点击放大: ${photo.filename}" loading="lazy"><p>${timePart}${sequencePart ? ` (${sequencePart})` : ""}</p>`;
+                    const imgEl = container.querySelector('img');
+                    if (imgEl && typeof handleImageError === 'function') handleImageError(imgEl);
                     container.onclick = () => openLightbox(photos, index);
                     fragment.appendChild(container);
                 });
@@ -1060,12 +1141,21 @@
                 updateLightboxContent();
                 lightboxModal.style.display = "flex";
                 document.body.style.overflow = "hidden";
+                document.body.classList.add('lightbox-open');
                 document.addEventListener("keydown", handleKeydownEvents);
             }
             function closeLightbox() {
                 lightboxModal.style.display = "none";
                 document.body.style.overflow = "auto";
+                document.body.classList.remove('lightbox-open');
                 document.removeEventListener("keydown", handleKeydownEvents);
+                // 派发自定义事件，供监控最大化同步清理定时器
+                try { document.dispatchEvent(new Event('lightboxClosed')); } catch (_) {}
+                // 如果是从轮播放大的，则在关闭覆盖层后恢复轮播弹层
+                if (overlayOrigin === 'slideshow' && isGlobalSlideshowActive) {
+                    if (photoSlideshowModal) photoSlideshowModal.style.display = 'flex';
+                }
+                overlayOrigin = null;
             }
             function updateLightboxContent() {
                 if (lightboxCurrentIndex < 0 || lightboxCurrentIndex >= lightboxCurrentItems.length) {
@@ -1497,6 +1587,8 @@
 
                     if (newPhoto.filename !== currentMonitorPhoto.filename) {
                         lastPollCount = 0;
+                        // 有新图片，适度加快下一次间隔，但不低于 MIN
+                        adaptiveIntervalMs = Math.max(MIN_INTERVAL_MS, Math.floor(adaptiveIntervalMs * FORWARD_FACTOR_NEW));
                         
                         currentMonitorPhoto.filename = newPhoto.filename;
                         currentMonitorPhoto.imageUrl = newPhoto.image_url;
@@ -1516,8 +1608,9 @@
                         
                         updateStatus("已更新为最新照片。", false);
                     } else {
-                        // 没有获取到新照片，增加轮询计数
+                        // 没有新照片，逐步退避，减轻后端压力
                         lastPollCount++;
+                        adaptiveIntervalMs = Math.min(MAX_INTERVAL_MS, Math.floor(adaptiveIntervalMs * BACKOFF_FACTOR_NO_CHANGE));
                     }
 
                     if (currentMonitorPhoto.timestampEpoch) {
@@ -1540,23 +1633,17 @@
 
                 const nowMs = Date.now();
                 const lastPhotoMs = lastPhotoEpochSeconds * 1000;
-                
-                // 计算下次轮询时间
-                // 基准时间 + (轮询次数 × 间隔时间) + 偏移量
-                const nextPollTimeMs = lastPhotoMs + ((lastPollCount + 1) * CAMERA_INTERVAL_MS) + POLLING_OFFSET_MS;
-                
-                let delayMs = nextPollTimeMs - nowMs;
-                
-                // 如果计算出的延迟时间小于最小轮询间隔，则使用最小轮询间隔
-                if (delayMs < POLLING_OFFSET_MS) {
-                    delayMs = CAMERA_INTERVAL_MS + POLLING_OFFSET_MS;
-                }
-
+                // 目标下一拍时间（估计值）：上一个时间点 + 自适应间隔 + 偏移
+                let targetNext = lastPhotoMs + adaptiveIntervalMs + POLLING_OFFSET_MS;
+                let delayMs = Math.max(MIN_INTERVAL_MS, targetNext - nowMs);
                 monitorTimeoutId = setTimeout(fetchAndDisplayLatestForMonitor, delayMs);
             }
             startMonitorBtn.onclick = async () => {
                 if (isMonitoringActive) return;
                 isMonitoringActive = true;
+                adaptiveIntervalMs = 1500;
+                lastPollCount = 0;
+                currentMonitorPhoto = { filename: "", imageUrl: "", timestampEpoch: 0, filesize: 0 };
                 if (currentState.level > 0 || currentState.date) {
                     saveCurrentStateToHistory();
                 }
@@ -1569,6 +1656,11 @@
                 startMonitorBtn.style.display = "none";
                 stopMonitorBtn.style.display = "inline-block";
                 updateStatus("启动实时监控...", false);
+                // 清空旧图，避免显示为加载失败占位
+                if (monitorImageEl) {
+                    monitorImageEl.removeAttribute('src');
+                    monitorImageEl.style.background = '';
+                }
                 await fetchAndDisplayLatestForMonitor();
             };
             stopMonitorBtn.onclick = () => {
@@ -1599,18 +1691,24 @@
                 const storedTheme = localStorage.getItem("galleryTheme") || "light";
                 applyTheme(storedTheme);
 
-                const earliestDateData = await fetchData("getEarliestDate", {});
                 let minDateOption = null;
-                if (earliestDateData && earliestDateData.earliestDate) {
-                    minDateOption = earliestDateData.earliestDate;
-                } else {
-                    console.warn("无法获取最早照片日期。");
-                }
+                let maxDateOption = null;
+                try {
+                    const earliestDateData = await fetchData("getEarliestDate", {});
+                    if (earliestDateData && earliestDateData.earliestDate) {
+                        minDateOption = earliestDateData.earliestDate;
+                    }
+                } catch (_) {}
+                try {
+                    const latestDateData = await fetchData("getLatestDate", {});
+                    if (latestDateData && latestDateData.latestDate) {
+                        maxDateOption = latestDateData.latestDate;
+                    }
+                } catch (_) {}
 
-                flatpickrInstance = flatpickr(datePickerEl, {
+                const fpOptions = {
                     dateFormat: "Y-m-d",
-                    maxDate: "today",
-                    minDate: minDateOption,
+                    maxDate: maxDateOption || "today",
                     // defaultDate will be set in onReady to ensure minDate is considered
                     onReady: function (selectedDates, dateStr, instance) {
                         const todayFull = new Date();
@@ -1639,6 +1737,11 @@
                     },
                     onChange: function (selectedDates, dateStr, instance) {
                         if (isMonitoringActive || isGlobalSlideshowActive) return;
+                        // 如果提供可选日期列表，强制限制在可选范围内
+                        if (availableDatesSet && dateStr && !availableDatesSet.has(dateStr)) {
+                            updateStatus(`该日期无照片：${dateStr}`, true);
+                            return;
+                        }
                         // Only process if a date is selected and it's different from current,
                         // OR if it's an initial load from level 0 (dateStr might be same as empty currentState.date initially)
                         if (dateStr && (dateStr !== currentState.date || currentState.level === 0)) {
@@ -1655,7 +1758,26 @@
                             updateUI();
                         }
                     },
-                });
+                };
+                if (minDateOption) fpOptions.minDate = minDateOption;
+                // 拉取可选日期列表以禁止无图日期
+                let availableDatesSet = null;
+                try {
+                    const ad = await fetchData('getAvailableDates', {});
+                    if (ad && Array.isArray(ad.availableDates)) {
+                        availableDatesSet = new Set(ad.availableDates);
+                        // 使用 flatpickr 的 disable 函数禁选无照片日期
+                        fpOptions.disable = [function(date) {
+                            // 使用 flatpickr 提供的格式化
+                            const y = date.getFullYear();
+                            const m = (date.getMonth()+1).toString().padStart(2,'0');
+                            const d = date.getDate().toString().padStart(2,'0');
+                            const ds = `${y}-${m}-${d}`;
+                            return !availableDatesSet.has(ds);
+                        }];
+                    }
+                } catch (_) {}
+                flatpickrInstance = flatpickr(datePickerEl, fpOptions);
                 // If onReady did not trigger an onChange (e.g. if dateToSetAsDefault was already selected by flatpickr by chance)
                 // and we are still at level 0, call updateUI to show initial message.
                 if (currentState.level === 0 && (!flatpickrInstance || flatpickrInstance.selectedDates.length === 0)) {
@@ -1749,30 +1871,117 @@
                 return `${size.toFixed(2)} ${units[unitIndex]}`;
             }
 
-            // 添加最大化功能
+            // 添加最大化功能（统一按钮定位与行为）
             function setupMaximizeButtons() {
                 document.querySelectorAll('.maximize-btn').forEach(btn => {
                     btn.addEventListener('click', function() {
                         const container = this.closest('.lightbox-image-container');
-                        const isMaximized = container.classList.toggle('maximized');
-                        
-                        // 更新按钮图标
-                        const path = this.querySelector('path');
-                        if (isMaximized) {
-                            path.setAttribute('d', 'M3 3h7v2H5v5H3V3m18 0v7h-2V5h-5V3h7M3 21v-7h2v5h5v2H3m18-7v7h-7v-2h5v-5h2');
-                            this.title = '还原';
-                        } else {
-                            path.setAttribute('d', 'M3 3h7v2H5v5H3V3m18 0v7h-2V5h-5V3h7M3 21v-7h2v5h5v2H3m18-7v7h-7v-2h5v-5h2');
-                            this.title = '最大化';
+                        if (!container) return;
+                        const overlayOpen = (lightboxModal && lightboxModal.style.display === 'flex');
+                        const isInOverlay = overlayOpen && lightboxModal.contains(container);
+
+                        // 若遮罩已打开
+                        if (overlayOpen) {
+                            // 仅当点击来自遮罩内部时，才切换遮罩最大化；否则忽略（防止误触底层按钮）
+                            if (isInOverlay) {
+                                const wasMax = container.classList.contains('maximized');
+                                container.classList.toggle('maximized');
+                                const isMax = !wasMax;
+                                this.title = isMax ? '还原' : '最大化';
+                                document.body.style.overflow = isMax ? 'hidden' : 'auto';
+                            }
+                            return;
                         }
+
+                        // 如果处于实时监控区域，改为打开覆盖层（复用查看大图的遮罩和全屏逻辑）
+                        if (container.closest('#monitoringSection')) {
+                            if (!currentMonitorPhoto || !currentMonitorPhoto.imageUrl) {
+                                updateStatus('暂无可放大的照片。', true);
+                                return;
+                            }
+                            // 构造一个不断刷新的代理项，保证轮询时覆盖层图片也会更新
+                            const proxyItems = [{ image_url: currentMonitorPhoto.imageUrl, filename: currentMonitorPhoto.filename, filesize: currentMonitorPhoto.filesize }];
+                            openLightbox(proxyItems, 0);
+                            overlayOrigin = 'monitor';
+                            setTimeout(() => {
+                                const overlayContainer = document.querySelector('#lightboxModal .lightbox-image-container');
+                                if (overlayContainer) overlayContainer.classList.add('maximized');
+                            }, 0);
+                            // 订阅监控图片更新，实时同步到覆盖层
+                            const syncOverlay = () => {
+                                if (lightboxModal.style.display !== 'flex') return; // 关闭后停止同步
+                                if (currentMonitorPhoto && currentMonitorPhoto.imageUrl) {
+                                    proxyItems[0].image_url = currentMonitorPhoto.imageUrl;
+                                    proxyItems[0].filename = currentMonitorPhoto.filename;
+                                    proxyItems[0].filesize = currentMonitorPhoto.filesize;
+                                    // 如果仍停留在第0项，直接刷新内容
+                                    if (lightboxCurrentIndex === 0) updateLightboxContent();
+                                }
+                            };
+                            // 在监控轮询后调用同步（轻量定时轮询即可）
+                            let overlaySyncTimer = setInterval(syncOverlay, 1000);
+                            const stopSync = () => { clearInterval(overlaySyncTimer); overlaySyncTimer = null; document.removeEventListener('lightboxClosed', stopSync); };
+                            document.addEventListener('lightboxClosed', stopSync);
+                            return;
+                        }
+                        // 轮播最大化改为复用遮罩层
+                        if (container.closest('#photoSlideshowModal')) {
+                            if (!globalSlideshowItems || globalSlideshowItems.length === 0) return;
+                            openLightbox(globalSlideshowItems, globalSlideshowCurrentIndex >= 0 ? globalSlideshowCurrentIndex : 0);
+                            overlayOrigin = 'slideshow';
+                            // 隐藏轮播弹层本体，避免看到两层
+                            if (photoSlideshowModal) photoSlideshowModal.style.display = 'none';
+                            setTimeout(() => {
+                                const overlayContainer = document.querySelector('#lightboxModal .lightbox-image-container');
+                                if (overlayContainer) overlayContainer.classList.add('maximized');
+                            }, 0);
+                            return;
+                        }
+                        // 其它场景（查看器）维持原生最大化切换
+                        const wasMax = container.classList.contains('maximized');
+                        if (wasMax) {
+                            container.classList.remove('maximized');
+                        } else {
+                            container.classList.add('maximized');
+                        }
+                        const isMax = !wasMax;
+                        this.title = isMax ? '还原' : '最大化';
+                        // 避免轮播最大化时出现两组按钮：打开覆盖层时隐藏底层按钮（CSS中已处理）
+                        document.body.style.overflow = isMax ? 'hidden' : 'auto';
                     });
                 });
+                const monitorClose = document.getElementById('monitorCloseBtn');
+                if (monitorClose) {
+                    monitorClose.addEventListener('click', () => {
+                        // 等价于点击“停止监控”
+                        if (stopMonitorBtn && typeof stopMonitorBtn.click === 'function') stopMonitorBtn.click();
+                    });
+                }
             }
 
             // 在页面加载完成后初始化最大化按钮
             document.addEventListener('DOMContentLoaded', function() {
                 setupMaximizeButtons();
-                // ... 其他初始化代码 ...
+                if (typeof handleImageError === 'function') {
+                    if (lightboxImage) handleImageError(lightboxImage);
+                    if (photoSlideshowImage) handleImageError(photoSlideshowImage);
+                }
+                setupMonitorImageHandlers();
+                // 注入 CSRF Token 到登出表单
+                try {
+                    const csrfInput = document.getElementById('logoutCsrf');
+                    if (csrfInput) {
+                        // 从后端注入的全局变量读取，否则回退到同步获取
+                        if (window.__CSRF_TOKEN__) {
+                            csrfInput.value = window.__CSRF_TOKEN__;
+                        } else {
+                            // 同步拉取一个极轻的端点（可选：改为在 index.php 由 PHP 内联注入 window.__CSRF_TOKEN__）
+                            fetch('login.php', { credentials: 'same-origin' }).then(()=>{
+                                // 若后端不注入，则保留空，服务端会拦截登出
+                            }).catch(()=>{});
+                        }
+                    }
+                } catch (e) {}
             });
 
             // 优化轮播和监控模式的切换动画
@@ -1801,8 +2010,21 @@
                 };
             }
 
-            // 修改现有的图片加载相关代码
-            document.querySelectorAll('img').forEach(handleImageError);
+            // 实时监控图像的专用加载处理：避免短暂闪现“加载失败”
+            function setupMonitorImageHandlers() {
+                if (!monitorImageEl) return;
+                // 初始隐藏错误占位，只在加载错误且非空时显示
+                monitorImageEl.addEventListener('error', () => {
+                    // 如果当前期望是空或仍在轮询阶段，忽略错误占位
+                    if (!currentMonitorPhoto || !currentMonitorPhoto.imageUrl) return;
+                    monitorImageEl.src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="160" height="100" viewBox="0 0 160 100"><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="sans-serif" font-size="14">加载失败</text></svg>';
+                    monitorImageEl.style.background = '#1f2937';
+                }, { passive: true });
+                monitorImageEl.addEventListener('load', () => {
+                    // 加载成功后，清理背景
+                    monitorImageEl.style.background = '';
+                }, { passive: true });
+            }
         </script>
     </body>
 </html>

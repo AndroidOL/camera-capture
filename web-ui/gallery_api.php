@@ -5,6 +5,14 @@
 
 require_once 'config.php'; // 引入密码和会话设置, 会自动 session_start()
 
+// --- 安全响应头（基础） ---
+if (!headers_sent()) {
+    header('X-Frame-Options: DENY');
+    header('Referrer-Policy: no-referrer');
+    header('X-Content-Type-Options: nosniff');
+    header("Content-Security-Policy: default-src 'self'");
+}
+
 // --- 会话和认证检查 ---
 if (!check_authentication()) { // 使用 config.php 中定义的函数
     // 在输出任何内容之前设置header
@@ -18,8 +26,9 @@ if (!check_authentication()) { // 使用 config.php 中定义的函数
 // --- 结束会话检查 ---
 
 // --- 配置 ---
-$basePhotoDir = '/var/www/html/captures'; // 照片在文件系统中的根目录
-$webPathToCaptures = '/captures';        // 对应的Web可访问路径前缀 (从Web根目录算起)
+// 将照片目录改为当前应用目录下的 captures，避免因服务器文档根目录差异导致路径不匹配
+$basePhotoDir = __DIR__ . '/captures'; // 照片在文件系统中的根目录（绝对路径）
+$webPathToCaptures = '/captures';      // 对应的Web可访问路径前缀（从当前站点根目录算起）
 
 // --- 缓存配置 ---
 define('CACHE_ENABLED', true);
@@ -192,6 +201,52 @@ if (!headers_sent()) {
     header('Content-Type: application/json');
 }
 
+// --- 简易限流（每 IP 每分钟 N 次） ---
+function rate_limit_check($key, $limit = 60, $window = 60) {
+    $dir = sys_get_temp_dir() . '/gallery_rl';
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    $file = $dir . '/' . md5($key);
+    $now = time();
+    $data = ['start' => $now, 'count' => 0];
+    if (file_exists($file)) {
+        $raw = @file_get_contents($file);
+        if ($raw) {
+            $data = @json_decode($raw, true) ?: $data;
+        }
+    }
+    if ($now - ($data['start'] ?? 0) >= $window) {
+        $data = ['start' => $now, 'count' => 0];
+    }
+    $data['count'] = ($data['count'] ?? 0) + 1;
+    @file_put_contents($file, json_encode($data));
+    if ($data['count'] > $limit) {
+        if (!headers_sent()) {
+            http_response_code(429);
+            header('Retry-After: ' . max(1, $window - ($now - ($data['start'] ?? $now))));
+        }
+        echo json_encode(['error' => 'Too Many Requests']);
+        exit;
+    }
+}
+
+// --- 简易缓存头（ETag/Last-Modified）工具 ---
+function send_cache_headers($etag = null, $last_modified = null, $ttl = 0) {
+    if (!headers_sent()) {
+        if ($ttl > 0) {
+            header('Cache-Control: public, max-age=' . (int)$ttl);
+        } else {
+            header('Cache-Control: no-store');
+        }
+        if ($etag) header('ETag: ' . $etag);
+        if ($last_modified) header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $last_modified) . ' GMT');
+    }
+    $if_none_match = $_SERVER['HTTP_IF_NONE_MATCH'] ?? null;
+    if ($etag && $if_none_match && trim($if_none_match) === $etag) {
+        http_response_code(304);
+        exit;
+    }
+}
+
 // 不需要日期参数的 actions
 if ($action === 'getEarliestDate') {
     $earliestDateStr = null;
@@ -210,27 +265,84 @@ if ($action === 'getEarliestDate') {
             }
         }
     }
+    send_cache_headers(null, null, 60);
     echo json_encode(['earliestDate' => $earliestDateStr]);
     exit;
 }
 
-if ($action === 'getLatestPhoto') {
-    $latestPhotoData = null;
+if ($action === 'getLatestDate') {
+    $latestDateStr = null;
     $yearMonthDirs = glob($basePhotoDir . '/????-??', GLOB_ONLYDIR);
     if (!empty($yearMonthDirs)) {
-        rsort($yearMonthDirs); 
+        rsort($yearMonthDirs); // 最新的年-月在前
         $latestYearMonthPath = $yearMonthDirs[0];
         $dayDirs = glob($latestYearMonthPath . '/[0-3][0-9]', GLOB_ONLYDIR);
         if (!empty($dayDirs)) {
             $dayBasenames = array_map('basename', $dayDirs);
-            rsort($dayBasenames, SORT_NUMERIC); 
+            rsort($dayBasenames, SORT_NUMERIC); // 最新的日期在前
+            if (!empty($dayBasenames)) {
+                $latestDay = $dayBasenames[0];
+                $yearMonthPart = basename($latestYearMonthPath);
+                $latestDateStr = $yearMonthPart . '-' . sprintf('%02d', (int)$latestDay);
+            }
+        }
+    }
+    echo json_encode(['latestDate' => $latestDateStr]);
+    exit;
+}
+
+if ($action === 'getAvailableDates') {
+    $dates = [];
+    $yearMonthDirs = glob($basePhotoDir . '/????-??', GLOB_ONLYDIR);
+    if (!empty($yearMonthDirs)) {
+        sort($yearMonthDirs); // 从早到晚
+        foreach ($yearMonthDirs as $ymPath) {
+            $ym = basename($ymPath); // YYYY-MM
+            $dayDirs = glob($ymPath . '/[0-3][0-9]', GLOB_ONLYDIR);
+            if (empty($dayDirs)) continue;
+            sort($dayDirs, SORT_NATURAL);
+            foreach ($dayDirs as $dayPath) {
+                $day = basename($dayPath); // DD
+                // 仅检查是否存在至少一张照片，避免全量遍历
+                $hasPhoto = glob($dayPath . '/capture_*.jpg', GLOB_NOSORT);
+                if (!empty($hasPhoto)) {
+                    $dates[] = $ym . '-' . sprintf('%02d', (int)$day);
+                }
+            }
+        }
+    }
+    echo json_encode(['availableDates' => $dates]);
+    exit;
+}
+
+if ($action === 'getLatestPhoto') {
+    rate_limit_check('latest_photo:' . ($_SERVER['REMOTE_ADDR'] ?? 'unknown'), 60, 60);
+    $latestPhotoData = null;
+    $yearMonthDirs = glob($basePhotoDir . '/????-??', GLOB_ONLYDIR);
+    if (!empty($yearMonthDirs)) {
+        rsort($yearMonthDirs);
+        $latestYearMonthPath = $yearMonthDirs[0];
+        $dayDirs = glob($latestYearMonthPath . '/[0-3][0-9]', GLOB_ONLYDIR);
+        if (!empty($dayDirs)) {
+            $dayBasenames = array_map('basename', $dayDirs);
+            rsort($dayBasenames, SORT_NUMERIC);
             if (!empty($dayBasenames)) {
                 $latestDay = $dayBasenames[0];
                 $latestDayPathOnFs = $latestYearMonthPath . '/' . $latestDay;
+
+                // 目录未变化则直接走缓存，避免频繁扫描文件列表
+                $dir_mtime = @filemtime($latestDayPathOnFs) ?: 0;
+                $cache_key = 'latest_photo_' . md5($latestDayPathOnFs);
+                $cached = get_cached_data($cache_key);
+                if (is_array($cached) && isset($cached['dir_mtime']) && $cached['dir_mtime'] === $dir_mtime) {
+                    echo json_encode(['latest_photo' => $cached['latest_photo']]);
+                    exit;
+                }
+
                 $photoPattern = $latestDayPathOnFs . '/capture_*.jpg';
                 $allPhotosInLatestDay = glob($photoPattern);
                 if (!empty($allPhotosInLatestDay)) {
-                    rsort($allPhotosInLatestDay); 
+                    rsort($allPhotosInLatestDay);
                     $latestPhotoFullPath = $allPhotosInLatestDay[0];
                     $relative_web_path = get_relative_path_for_web($latestPhotoFullPath, $basePhotoDir);
                     if ($relative_web_path) {
@@ -241,9 +353,18 @@ if ($action === 'getLatestPhoto') {
                         ];
                     }
                 }
+
+                // 写入缓存（包含目录 mtime 用于快速命中）
+                set_cached_data($cache_key, ['dir_mtime' => $dir_mtime, 'latest_photo' => $latestPhotoData]);
             }
         }
     }
+    $lm = 0;
+    if ($latestPhotoData) {
+        $lm = time();
+    }
+    $etag = '"' . md5(json_encode($latestPhotoData)) . '"';
+    send_cache_headers($etag, $lm, 0);
     echo json_encode(['latest_photo' => $latestPhotoData]);
     exit;
 }
@@ -267,8 +388,9 @@ list($year, $month, $day) = $date_parts;
 $photoDayDirOnFs = "{$basePhotoDir}/{$year}-{$month}/{$day}"; 
 
 if (!is_dir($photoDayDirOnFs)) { 
+    log_error('Photo directory not found', ['date' => $date_str, 'path' => $photoDayDirOnFs]);
     echo json_encode([ 
-        'error' => "Photo directory not found for date {$date_str}. Path: {$photoDayDirOnFs}", 
+        'error' => "Photo directory not found for date {$date_str}", 
         'date' => $date_str,
         'hourly_previews' => [], 'ten_minute_previews' => [], 'minute_previews' => [], 'photos' => [] 
     ]); 
@@ -335,6 +457,34 @@ function get_image_data($full_fs_path, $for_preview = false) {
 }
 
 switch ($action) {
+    case 'getLatestMeta': // 轻量元信息：用于前端先判更新
+        $meta = ['dir_mtime' => null, 'latest_filename' => null, 'filesize' => null];
+        $yearMonthDirs = glob($basePhotoDir . '/????-??', GLOB_ONLYDIR);
+        if (!empty($yearMonthDirs)) {
+            rsort($yearMonthDirs);
+            $latestYearMonthPath = $yearMonthDirs[0];
+            $dayDirs = glob($latestYearMonthPath . '/[0-3][0-9]', GLOB_ONLYDIR);
+            if (!empty($dayDirs)) {
+                $dayBasenames = array_map('basename', $dayDirs);
+                rsort($dayBasenames, SORT_NUMERIC);
+                if (!empty($dayBasenames)) {
+                    $latestDay = $dayBasenames[0];
+                    $latestDayPathOnFs = $latestYearMonthPath . '/' . $latestDay;
+                    $meta['dir_mtime'] = @filemtime($latestDayPathOnFs) ?: null;
+                    $photoPattern = $latestDayPathOnFs . '/capture_*.jpg';
+                    $all = glob($photoPattern);
+                    if (!empty($all)) {
+                        rsort($all);
+                        $latest = $all[0];
+                        $meta['latest_filename'] = basename($latest);
+                        $meta['filesize'] = get_file_size($latest);
+                    }
+                }
+            }
+        }
+        send_cache_headers('"' . md5(json_encode($meta)) . '"', time(), 0);
+        echo json_encode(['meta' => $meta]);
+        break;
     case 'getDailySummary':
         $hourly_previews = [];
         for ($h = 23; $h >= 0; $h--) { 

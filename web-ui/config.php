@@ -2,8 +2,9 @@
 // config.php
 
 // !!! 警告：生产环境中绝不要明文存储密码 !!!
-// !!! 请使用 password_hash() 生成哈希值，并使用 password_verify() 进行验证 !!!
-define('GALLERY_PASSWORD', 'passowrd'); // 【请务必修改为您自己的强密码】
+// 如需切换到哈希存储：将下行替换为 password_hash('your-strong-password', PASSWORD_DEFAULT) 的结果
+// define('GALLERY_PASSWORD_HASH', '');
+define('GALLERY_PASSWORD', '1001'); // 兼容旧配置；设置 GALLERY_PASSWORD_HASH 后可删除此行
 
 define('SESSION_NAME', 'PhotoGallerySession'); // 自定义会话名称
 define('SESSION_TIMEOUT_DURATION', 1800); // Session超时时间 (秒), 例如30分钟 = 1800
@@ -56,11 +57,32 @@ function check_authentication() {
  * 认证成功后设置会话
  */
 function set_authenticated_session() {
-    // session_regenerate_id(true); // 登录成功后重新生成 Session ID，防止会话固定攻击
+    // 登录成功后建议重新生成 Session ID（在 login.php 已调用）
     $_SESSION['authenticated'] = true;
     $_SESSION['last_activity'] = time();
     $_SESSION['user_ip'] = $_SERVER['REMOTE_ADDR']; // 记录IP用于校验 (可选)
     $_SESSION['user_agent'] = $_SERVER['HTTP_USER_AGENT']; // 记录User Agent (可选)
+}
+
+/**
+ * CSRF Token helpers
+ */
+function get_csrf_token() {
+    if (empty($_SESSION['csrf_token'])) {
+        if (function_exists('random_bytes')) {
+            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+        } elseif (function_exists('openssl_random_pseudo_bytes')) {
+            $_SESSION['csrf_token'] = bin2hex(openssl_random_pseudo_bytes(32));
+        } else {
+            $_SESSION['csrf_token'] = bin2hex(mt_rand()) . bin2hex(mt_rand());
+        }
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function validate_csrf_token($token) {
+    if (!isset($_SESSION['csrf_token']) || !is_string($token)) return false;
+    return hash_equals($_SESSION['csrf_token'], $token);
 }
 
 /**
