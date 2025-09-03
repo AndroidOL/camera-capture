@@ -19,7 +19,7 @@
 # ==============================================================================
 
 # --- Configuration Parameters ---
-readonly SCRIPT_VERSION="1.4.3"
+readonly SCRIPT_VERSION="1.5.1"
 # ... (Rest of CONFIGURATION PARAMETERS are IDENTICAL to v1.4.2) ...
 readonly SCRIPT_NAME="$(basename "$0")"
 
@@ -28,24 +28,25 @@ readonly ARMBIAN_IP="am40.tianhao.me"
 readonly ARMBIAN_IMAGE_BASE_DIR="/opt/camera/captures"      # No trailing slash
 
 readonly RAMDISK_MOUNT_POINT="/mnt/ramdisk"
-readonly RAMDISK_SIZE="5G"
+readonly RAMDISK_SIZE="5G" # legacy default; actual size will be computed dynamically at mount time
 readonly IMAGE_STAGING_PARENT_DIR_ON_RAMDISK="${RAMDISK_MOUNT_POINT}/image_source" # No trailing slash
 readonly FFMPEG_TEMP_OUTPUT_PARENT_DIR_ON_RAMDISK="${RAMDISK_MOUNT_POINT}/ffmpeg_tmp" # No trailing slash
 
 readonly PRIMARY_FINAL_VIDEO_TARGET_BASE_DIR="/opt/camera/merge"    # No trailing slash
 readonly FALLBACK_FINAL_VIDEO_TARGET_BASE_DIR="/opt/camera/merge-emmc" # No trailing slash
-readonly FFMPEG_EXE_PATH="/usr/local/ffmpeg-rockchip/bin/ffmpeg"
+readonly FFMPEG_EXE_PATH="/usr/bin/ffmpeg"
 
 readonly OUTPUT_FPS="6"
 readonly VIDEO_CODEC="hevc_rkmpp"
 readonly VIDEO_BITRATE="1M"
+readonly VIDEO_QUALITY="26"
 
 readonly LOG_FILE="/var/log/daily_photo_to_video.log"
 readonly LOG_MAX_SIZE_KB=10240 
 readonly DEFAULT_ENABLE_SYSLOG_LOGGING="true"
 readonly SYSLOG_TAG="${SCRIPT_NAME}" 
 
-readonly MAX_CATCH_UP_DAYS=7
+readonly MAX_CATCH_UP_DAYS=10
 readonly MIN_VALID_VIDEO_SIZE_KB=10 
 
 readonly DEFAULT_DRY_RUN_CONFIG="false" 
@@ -56,6 +57,36 @@ readonly LOCK_FILE_DIR="/var/lock"
 readonly LOCK_FILE_NAME="${SCRIPT_NAME}.lock"
 readonly LOCK_FD=200 
 # --- End of Configuration Parameters ---
+
+# --- PushPlus Notification Configuration ---
+readonly DEFAULT_ENABLE_PUSHPLUS="true"
+readonly PUSHPLUS_API_URL="https://www.pushplus.plus/send"
+
+# --- Reliability/Timeout Configuration ---
+readonly RSYNC_MAX_ATTEMPTS="3"
+readonly RSYNC_RETRY_DELAY_SEC="10"
+readonly RSYNC_TIMEOUT_SEC="900"              # hard timeout wrapper seconds (if `timeout` is available)
+readonly FFMPEG_MAX_ATTEMPTS="2"
+readonly FFMPEG_RETRY_DELAY_SEC="15"
+readonly FFMPEG_TIMEOUT_SEC="1800"            # hard timeout wrapper seconds (if `timeout` is available)
+readonly ENABLE_HARD_TIMEOUTS_DEFAULT="true"  # can be overridden via env: ENABLE_HARD_TIMEOUTS_ENV_OVERRIDE
+
+readonly TIMEOUT_CMD="$(command -v timeout || echo "")"
+readonly FFPROBE_EXE_PATH_GUESS="$(dirname "${FFMPEG_EXE_PATH}")/ffprobe"
+
+# --- Dynamic Ramdisk Sizing Config ---
+readonly RAMDISK_MIN_SIZE_MB_DEFAULT="5120"   # 5.0G min as requested
+readonly RAMDISK_MAX_SIZE_MB_DEFAULT="6144"   # cap around 6G by default
+readonly RAMDISK_RESERVE_MB_DEFAULT="1024"    # keep ~1G headroom
+RAMDISK_MIN_SIZE_MB="${RAMDISK_MIN_SIZE_MB_ENV_OVERRIDE:-${RAMDISK_MIN_SIZE_MB_DEFAULT}}"
+RAMDISK_MAX_SIZE_MB="${RAMDISK_MAX_SIZE_MB_ENV_OVERRIDE:-${RAMDISK_MAX_SIZE_MB_DEFAULT}}"
+RAMDISK_RESERVE_MB="${RAMDISK_RESERVE_MB_ENV_OVERRIDE:-${RAMDISK_RESERVE_MB_DEFAULT}}"
+
+# --- Output Size Estimation (permille to avoid floating point) ---
+readonly OUTPUT_ESTIMATE_INPUT_RATIO_PERMILLE_DEFAULT="100"   # 0.100 = 10%
+readonly OUTPUT_ESTIMATE_HEADROOM_PERMILLE_DEFAULT="120"      # 1.20 = +20%
+OUTPUT_ESTIMATE_INPUT_RATIO_PERMILLE="${OUTPUT_ESTIMATE_INPUT_RATIO_PERMILLE_ENV_OVERRIDE:-${OUTPUT_ESTIMATE_INPUT_RATIO_PERMILLE_DEFAULT}}"
+OUTPUT_ESTIMATE_HEADROOM_PERMILLE="${OUTPUT_ESTIMATE_HEADROOM_PERMILLE_ENV_OVERRIDE:-${OUTPUT_ESTIMATE_HEADROOM_PERMILLE_DEFAULT}}"
 
 
 # --- Script Internal Setup ---
@@ -72,6 +103,9 @@ DRY_RUN="${SCRIPT_DRY_RUN_ENV_OVERRIDE:-${DEFAULT_DRY_RUN_CONFIG}}"
 ENABLE_LOCKING="${SCRIPT_ENABLE_LOCKING_ENV_OVERRIDE:-${DEFAULT_ENABLE_LOCKING}}"
 ENABLE_SYSLOG_LOGGING="${SCRIPT_SYSLOG_LOG_ENV_OVERRIDE:-${DEFAULT_ENABLE_SYSLOG_LOGGING}}"
 SCRIPT_DEBUG_TRACE="${SCRIPT_DEBUG_TRACE_ENV_OVERRIDE:-${DEFAULT_SCRIPT_DEBUG_TRACE}}"
+ENABLE_HARD_TIMEOUTS="${ENABLE_HARD_TIMEOUTS_ENV_OVERRIDE:-${ENABLE_HARD_TIMEOUTS_DEFAULT}}"
+ENABLE_PUSHPLUS="${ENABLE_PUSHPLUS_ENV_OVERRIDE:-${DEFAULT_ENABLE_PUSHPLUS}}"
+PUSHPLUS_TOKEN="${PUSHPLUS_TOKEN_ENV_OVERRIDE:-}" # 从环境注入，避免硬编码
 
 if [[ "${SCRIPT_DEBUG_TRACE,,}" == "true" ]]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') [CONFIG] Bash execution trace (set -x) enabled." >&2 
@@ -90,6 +124,25 @@ FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP=""
 EFFECTIVE_FINAL_VIDEO_TARGET_BASE_DIR="${PRIMARY_FINAL_VIDEO_TARGET_BASE_DIR}" 
 DO_CATCH_UP_PROCESSING=true 
 CURRENT_PROCESSING_DATE_FOR_TRAP="N/A" 
+PREVIOUS_SCRIPT_RAMDISK_DETECTED=false 
+
+# --- Statistics (per-run) ---
+STATS_NUM_DATES_ATTEMPTED=0
+STATS_NUM_DATES_SUCCEEDED=0
+STATS_NUM_DATES_FAILED=0
+STATS_TOTAL_PHOTOS_SYNCED=0
+STATS_TOTAL_RSYNC_ATTEMPTS=0
+STATS_TOTAL_RSYNC_RETRIES=0
+STATS_TOTAL_FFMPEG_ATTEMPTS=0
+STATS_TOTAL_FFMPEG_RETRIES=0
+STATS_LAST_NUM_PHOTOS=0
+STATS_LAST_VIDEO_SECONDS=0
+STATS_TOTAL_OUTPUT_VIDEO_SECONDS=0
+STATS_LAST_VIDEO_SIZE_BYTES=0
+STATS_TOTAL_OUTPUT_VIDEO_SIZE_BYTES=0
+LAST_DATE_PROCESSED=""
+LAST_FINAL_VIDEO_PATH=""
+LAST_ENCODE_DIRECT="false"
 
 
 # --- Logging Functions ---
@@ -197,6 +250,55 @@ cleanup_on_exit() {
         fi
     fi
 
+    # Append per-run statistics near very end
+    log_stats_summary
+
+    # Build and send PushPlus markdown summary
+    if [[ "${ENABLE_PUSHPLUS,,}" == "true" && -n "${PUSHPLUS_TOKEN}" ]]; then
+        local end_epoch=$(date +%s)
+        local elapsed=$(( end_epoch - START_EPOCH ))
+        local md_body
+        md_body=$(cat <<MD_EOF
+## 每日相册转码任务结果
+
+- **脚本版本**: v${SCRIPT_VERSION}
+- **运行ID**: ${RUN_ID}
+- **执行用户**: $(whoami)
+- **执行模式**: ${DRY_RUN}
+- **锁启用**: ${ENABLE_LOCKING}
+- **Ramdisk**: ${RAMDISK_MOUNT_POINT} (mounted by script: ${SCRIPT_MOUNTED_RAMDISK})
+
+### 处理摘要
+- **日期尝试**: ${STATS_NUM_DATES_ATTEMPTED}
+- **成功**: ${STATS_NUM_DATES_SUCCEEDED}
+- **失败**: ${STATS_NUM_DATES_FAILED}
+- **总照片数**: ${STATS_TOTAL_PHOTOS_SYNCED}
+
+### 编解码
+- **Rsync 尝试/重试**: ${STATS_TOTAL_RSYNC_ATTEMPTS} / ${STATS_TOTAL_RSYNC_RETRIES}
+- **FFmpeg 尝试/重试**: ${STATS_TOTAL_FFMPEG_ATTEMPTS} / ${STATS_TOTAL_FFMPEG_RETRIES}
+
+### 输出
+- **最新视频时长**: ${STATS_LAST_VIDEO_SECONDS} 秒 ($(format_hms ${STATS_LAST_VIDEO_SECONDS}))
+- **累计视频时长**: ${STATS_TOTAL_OUTPUT_VIDEO_SECONDS} 秒 ($(format_hms ${STATS_TOTAL_OUTPUT_VIDEO_SECONDS}))
+- **最新视频大小**: ${STATS_LAST_VIDEO_SIZE_BYTES} B
+- **累计视频大小**: ${STATS_TOTAL_OUTPUT_VIDEO_SIZE_BYTES} B
+- **最后处理日期**: ${LAST_DATE_PROCESSED}
+- **最终视频路径**: ${LAST_FINAL_VIDEO_PATH}
+- **是否直写最终路径**: ${LAST_ENCODE_DIRECT}
+
+### 耗时
+- **总耗时**: ${elapsed} 秒 ($(format_hms ${elapsed}))
+MD_EOF
+)
+        # JSON-stringify markdown
+        local md_json
+        md_json=$(printf '%s' "${md_body}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g')
+        md_json="\"${md_json}\""
+
+        pushplus_send_markdown "相册转码结果 (RUN_ID:${RUN_ID})" "${md_json}" || log_error "Failed to send PushPlus notification."
+    fi
+
     log_info "--- Main Cleanup Finished (Exit Status: ${exit_status}) ---"
     if [ "${exit_status}" -ne 0 ]; then
       log_error "Script is exiting with an overall error status: ${exit_status}."
@@ -210,10 +312,210 @@ handle_error() {
 }
 trap 'handle_error $LINENO "$BASH_COMMAND" $?' ERR
 
+# Termination signals
+trap 'log_error "Received SIGINT. Aborting run gracefully."; exit 130' INT
+trap 'log_error "Received SIGTERM. Aborting run gracefully."; exit 143' TERM
+
 
 # --- Utility and Core Logic Functions ---
 # (rotate_log, check_dependencies, setup_ramdisk_if_needed, determine_target_config, 
 #  select_date_to_process, process_single_date now use the new execute_cmd signature)
+
+# --- Reliability Helpers ---
+supports_hard_timeouts() {
+    [[ -n "${TIMEOUT_CMD}" && "${ENABLE_HARD_TIMEOUTS,,}" == "true" ]]
+}
+
+safe_sleep() { # sleep with guard against negative/empty
+    local seconds="$1"
+    if [[ -z "${seconds}" || "${seconds}" -lt 1 ]]; then
+        seconds=1
+    fi
+    sleep "${seconds}"
+}
+
+# run_with_retry CATEGORY DESCRIPTION MAX_ATTEMPTS RETRY_DELAY_SEC TIMEOUT_SEC ACCEPTABLE_CODES_CSV -- CMD ARGS...
+run_with_retry() {
+    local category="$1"; shift
+    local desc="$1"; shift
+    local max_attempts="$1"; shift
+    local retry_delay="$1"; shift
+    local timeout_sec="$1"; shift
+    local acceptable_csv="$1"; shift
+    # Expect -- separator before command
+    if [[ "$1" != "--" ]]; then
+        log_warn "run_with_retry called without -- separator for ${desc}. Proceeding anyway."
+    else
+        shift
+    fi
+    local -a cmd=("$@")
+
+    local attempt=1
+    local rc=0
+
+    while :; do
+        local attempt_note="attempt ${attempt}/${max_attempts}"
+        if supports_hard_timeouts && [[ -n "${timeout_sec}" && "${timeout_sec}" -gt 0 ]]; then
+            local timeout_duration="${timeout_sec}s"
+            local kill_after="5s"
+            # 预检测 timeout 支持的标志，尽量使用 --preserve-status 与 --foreground，避免残留与状态丢失
+            local -a timeout_flags=("-k" "${kill_after}" "${timeout_duration}")
+            if "${TIMEOUT_CMD}" --help 2>&1 | grep -q -- "--preserve-status"; then
+                timeout_flags=("--preserve-status" "${timeout_flags[@]}")
+            fi
+            if "${TIMEOUT_CMD}" --help 2>&1 | grep -q -- "--foreground"; then
+                timeout_flags=("--foreground" "${timeout_flags[@]}")
+            fi
+            log_info "${desc} with timeout ${timeout_duration} (${attempt_note})"
+            if "${TIMEOUT_CMD}" "${timeout_flags[@]}" "${cmd[@]}"; then rc=0; else rc=$?; fi
+        else
+            log_info "${desc} (${attempt_note})"
+            if "${cmd[@]}"; then rc=0; else rc=$?; fi
+        fi
+
+        # Stats by category
+        case "${category}" in
+            RSYNC)
+                STATS_TOTAL_RSYNC_ATTEMPTS=$((STATS_TOTAL_RSYNC_ATTEMPTS + 1))
+                ;;
+            FFMPEG)
+                STATS_TOTAL_FFMPEG_ATTEMPTS=$((STATS_TOTAL_FFMPEG_ATTEMPTS + 1))
+                ;;
+        esac
+
+        # Check acceptable non-zero codes
+        if [[ ${rc} -ne 0 && -n "${acceptable_csv}" ]]; then
+            IFS=',' read -r -a acceptable_arr <<< "${acceptable_csv}"
+            local code
+            for code in "${acceptable_arr[@]}"; do
+                if [[ "${rc}" -eq "${code}" ]]; then
+                    log_warn "${desc} returned acceptable non-zero code ${rc}; treating as success."
+                    rc=0
+                    break
+                fi
+            done
+        fi
+
+        if [[ ${rc} -eq 0 ]]; then
+            return 0
+        fi
+
+        if [[ ${attempt} -ge ${max_attempts} ]]; then
+            log_error "${desc} failed after ${attempt} attempts. Last status: ${rc}."
+            return ${rc}
+        fi
+
+        case "${category}" in
+            RSYNC) STATS_TOTAL_RSYNC_RETRIES=$((STATS_TOTAL_RSYNC_RETRIES + 1)) ;;
+            FFMPEG) STATS_TOTAL_FFMPEG_RETRIES=$((STATS_TOTAL_FFMPEG_RETRIES + 1)) ;;
+        esac
+
+        log_warn "${desc} failed with status ${rc}. Retrying after ${retry_delay}s..."
+        safe_sleep "${retry_delay}"
+        attempt=$((attempt + 1))
+    done
+}
+
+# Compute duration in seconds using ffprobe when available
+probe_video_duration_seconds() {
+    local video_path="$1"
+    local ffprobe_path="${FFPROBE_EXE_PATH_GUESS}"
+    if [[ -x "${ffprobe_path}" ]]; then
+        local duration
+        duration=$("${ffprobe_path}" -v error -hide_banner -show_entries format=duration -of default=nw=1:nk=1 "${video_path}" 2>/dev/null || echo "0")
+        # Truncate to integer seconds
+        printf '%d\n' "${duration%%.*}" 2>/dev/null || echo 0
+        return 0
+    fi
+    echo 0
+}
+
+parse_bitrate_to_bps() {
+    local rate="$1"
+    local lower="${rate,,}"
+    local num
+    case "${lower}" in
+        *m)
+            num="${lower%m}"
+            echo $(( num * 1000000 ))
+            ;;
+        *k)
+            num="${lower%k}"
+            echo $(( num * 1000 ))
+            ;;
+        *)
+            # assume plain bits per second integer
+            echo $(( lower ))
+            ;;
+    esac
+}
+
+format_hms() {
+    local total="$1"
+    local h=$(( total / 3600 ))
+    local m=$(( (total % 3600) / 60 ))
+    local s=$(( total % 60 ))
+    printf '%02d:%02d:%02d' "${h}" "${m}" "${s}"
+}
+
+log_stats_summary() {
+    local end_epoch=$(date +%s)
+    local elapsed=$(( end_epoch - START_EPOCH ))
+    log_info "--- Run Statistics Summary ---"
+    log_info "Dates attempted: ${STATS_NUM_DATES_ATTEMPTED}; succeeded: ${STATS_NUM_DATES_SUCCEEDED}; failed: ${STATS_NUM_DATES_FAILED}"
+    log_info "Photos synced (total): ${STATS_TOTAL_PHOTOS_SYNCED}; last date photos: ${STATS_LAST_NUM_PHOTOS}"
+    log_info "Rsync attempts: ${STATS_TOTAL_RSYNC_ATTEMPTS}; retries: ${STATS_TOTAL_RSYNC_RETRIES}"
+    log_info "FFmpeg attempts: ${STATS_TOTAL_FFMPEG_ATTEMPTS}; retries: ${STATS_TOTAL_FFMPEG_RETRIES}"
+    log_info "Video seconds (total): ${STATS_TOTAL_OUTPUT_VIDEO_SECONDS} ($(format_hms ${STATS_TOTAL_OUTPUT_VIDEO_SECONDS})); last video seconds: ${STATS_LAST_VIDEO_SECONDS}"
+    log_info "Output size bytes (total): ${STATS_TOTAL_OUTPUT_VIDEO_SIZE_BYTES}; last size bytes: ${STATS_LAST_VIDEO_SIZE_BYTES}"
+    log_info "Elapsed seconds: ${elapsed} ($(format_hms ${elapsed}))"
+    log_info "--- End of Run Statistics ---"
+}
+
+md_escape() {
+    # Escape characters that may break markdown formatting in push content
+    # For simplicity, replace backticks and backslashes; do not over-escape code blocks
+    sed -E 's/\\/\\\\/g; s/`/\`/g'
+}
+
+pushplus_send_markdown() {
+    if [[ "${ENABLE_PUSHPLUS,,}" != "true" ]]; then
+        return 0
+    fi
+    if [[ -z "${PUSHPLUS_TOKEN}" ]]; then
+        log_warn "PushPlus enabled but PUSHPLUS_TOKEN is empty. Skip sending."
+        return 0
+    fi
+    local title="$1"
+    local content_md="$2"
+    local payload
+    # Build JSON safely. Use printf %q is not JSON-safe; construct with minimal escaping.
+    # We rely on curl --data and set content-type application/json
+    payload=$(cat <<JSON
+{
+  "token": "${PUSHPLUS_TOKEN}",
+  "title": "${title}",
+  "content": ${content_md},
+  "template": "markdown",
+  "channel": "wechat"
+}
+JSON
+)
+    # Send
+    local http_code
+    http_code=$(curl -sS -o /tmp/pushplus_resp_${RUN_ID}.json -w "%{http_code}" -H "Content-Type: application/json" -X POST "${PUSHPLUS_API_URL}" --data "${payload}" || echo "000")
+    if [[ "${http_code}" != "200" ]]; then
+        log_error "PushPlus HTTP status ${http_code}. Response: $(head -c 2000 /tmp/pushplus_resp_${RUN_ID}.json 2>/dev/null | tr -d '\n')"
+        return 1
+    fi
+    local code_field
+    code_field=$(grep -o '"code"[[:space:]]*:[[:space:]]*[0-9]+' /tmp/pushplus_resp_${RUN_ID}.json 2>/dev/null | head -n1 | sed -E 's/.*: *([0-9]+).*/\1/')
+    if [[ -n "${code_field}" && "${code_field}" -ne 200 ]]; then
+        log_error "PushPlus returned code=${code_field}. Raw: $(head -c 2000 /tmp/pushplus_resp_${RUN_ID}.json | tr -d '\n')"
+        return 1
+    fi
+    log_info "PushPlus sent successfully."
+}
 
 rotate_log() { 
     if [ "${LOG_MAX_SIZE_KB}" -gt 0 ] && [ -f "${LOG_FILE}" ]; then
@@ -244,10 +546,10 @@ rotate_log() {
 
 check_dependencies() { # No side-effects within, so no execute_cmd calls
     log_info "Checking script dependencies..."
-    # ... (Identical to v1.4.2)
+    # ... enhanced with advisory checks for optional tools
     local missing_deps=0
     local dep
-    for dep in rsync "${FFMPEG_EXE_PATH}" date find mkdir rm stat tee du mv wc mountpoint cp umount mount ssh grep sort head dirname uuidgen flock logger; do
+    for dep in rsync "${FFMPEG_EXE_PATH}" date find mkdir rm stat tee du mv wc mountpoint cp umount mount ssh grep sort head dirname uuidgen flock logger curl; do
         if ! command -v "${dep}" &> /dev/null; then
             if [ "${dep}" == "uuidgen" ]; then 
                 log_error "Critical dependency missing: ${dep}. Consider installing 'uuid-runtime' package or similar."
@@ -257,6 +559,14 @@ check_dependencies() { # No side-effects within, so no execute_cmd calls
             missing_deps=1
         fi
     done
+    # Optional tools: timeout, ffprobe
+    if [[ -z "${TIMEOUT_CMD}" ]]; then
+        log_warn "Optional tool 'timeout' not found. Hard timeouts will be disabled."
+        ENABLE_HARD_TIMEOUTS="false"
+    fi
+    if [[ ! -x "${FFPROBE_EXE_PATH_GUESS}" ]]; then
+        log_warn "Optional tool 'ffprobe' not found at ${FFPROBE_EXE_PATH_GUESS}. Video duration stats will be 0."
+    fi
     if [ "${missing_deps}" -eq 1 ]; then
         log_error "One or more critical dependencies are missing. Exiting."
         exit 1 
@@ -274,15 +584,38 @@ setup_ramdisk_if_needed() {
 
     if mountpoint -q "${RAMDISK_MOUNT_POINT}"; then
         if findmnt -n -o FSTYPE -T "${RAMDISK_MOUNT_POINT}" | grep -q "^tmpfs$"; then
-            log_warn "Ramdisk ${RAMDISK_MOUNT_POINT} is already mounted as tmpfs. Using existing mount."
+            # 已经是 tmpfs，检查是否包含脚本惯用的目录，用于判定是否为本脚本先前挂载
+            if [ -d "${IMAGE_STAGING_PARENT_DIR_ON_RAMDISK}" ] && [ -d "${FFMPEG_TEMP_OUTPUT_PARENT_DIR_ON_RAMDISK}" ]; then
+                PREVIOUS_SCRIPT_RAMDISK_DETECTED=true
+                log_info "Ramdisk ${RAMDISK_MOUNT_POINT} 已挂载且检测到脚本期望的目录存在，视为之前由本脚本挂载。跳过挂载步骤。"
+            else
+                log_warn "Ramdisk ${RAMDISK_MOUNT_POINT} 已挂载为 tmpfs，但未检测到脚本期望的目录。将按需创建目录后继续。"
+            fi
             SCRIPT_MOUNTED_RAMDISK=false 
         else
             log_error "Critical: ${RAMDISK_MOUNT_POINT} is mounted but NOT as tmpfs. Exiting."
             exit 1
         fi
     else
-        log_info "Attempting to mount tmpfs ramdisk at ${RAMDISK_MOUNT_POINT} with size ${RAMDISK_SIZE}..."
-        if ! execute_cmd "Mount tmpfs ramdisk" "mount" "-t" "tmpfs" "-o" "size=${RAMDISK_SIZE},noatime" "tmpfs" "${RAMDISK_MOUNT_POINT}"; then
+        # Compute dynamic size based on MemAvailable and a reserve margin; clamp between min and max
+        local mem_available_kb
+        mem_available_kb=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+        local mem_available_mb=$(( mem_available_kb / 1024 ))
+        local desired_mb
+        if [[ ${mem_available_mb} -gt ${RAMDISK_RESERVE_MB} ]]; then
+            desired_mb=$(( mem_available_mb - RAMDISK_RESERVE_MB ))
+        else
+            desired_mb=${RAMDISK_MIN_SIZE_MB}
+        fi
+        if [[ ${desired_mb} -lt ${RAMDISK_MIN_SIZE_MB} ]]; then
+            desired_mb=${RAMDISK_MIN_SIZE_MB}
+        fi
+        if [[ ${desired_mb} -gt ${RAMDISK_MAX_SIZE_MB} ]]; then
+            desired_mb=${RAMDISK_MAX_SIZE_MB}
+        fi
+        local size_opt="${desired_mb}m"
+        log_info "Attempting to mount tmpfs ramdisk at ${RAMDISK_MOUNT_POINT} with dynamic size ${size_opt} (Avail: ${mem_available_mb}MB, Reserve: ${RAMDISK_RESERVE_MB}MB, Clamp: ${RAMDISK_MIN_SIZE_MB}-${RAMDISK_MAX_SIZE_MB}MB) ..."
+        if ! execute_cmd "Mount tmpfs ramdisk" "mount" "-t" "tmpfs" "-o" "size=${size_opt},noatime" "tmpfs" "${RAMDISK_MOUNT_POINT}"; then
             exit 1 
         fi
         SCRIPT_MOUNTED_RAMDISK=true 
@@ -460,9 +793,20 @@ process_single_date() { # Uses execute_cmd
     log_info "Target Ramdisk ffmpeg temporary video: ${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}"
     log_info "Target Final video storage: ${final_video_file_path}"
 
-    execute_cmd "Create image staging dir" "mkdir" "-p" "${CURRENT_IMAGE_STAGING_DIR_FOR_TRAP}" || return 1
-    execute_cmd "Create ffmpeg temp parent dir" "mkdir" "-p" "${FFMPEG_TEMP_OUTPUT_PARENT_DIR_ON_RAMDISK}" || return 1
-    execute_cmd "Create final video output subdir" "mkdir" "-p" "${final_video_output_subdir}" || return 1
+    STATS_NUM_DATES_ATTEMPTED=$((STATS_NUM_DATES_ATTEMPTED + 1))
+
+    if ! execute_cmd "Create image staging dir" "mkdir" "-p" "${CURRENT_IMAGE_STAGING_DIR_FOR_TRAP}"; then
+        STATS_NUM_DATES_FAILED=$((STATS_NUM_DATES_FAILED + 1))
+        return 1
+    fi
+    if ! execute_cmd "Create ffmpeg temp parent dir" "mkdir" "-p" "${FFMPEG_TEMP_OUTPUT_PARENT_DIR_ON_RAMDISK}"; then
+        STATS_NUM_DATES_FAILED=$((STATS_NUM_DATES_FAILED + 1))
+        return 1
+    fi
+    if ! execute_cmd "Create final video output subdir" "mkdir" "-p" "${final_video_output_subdir}"; then
+        STATS_NUM_DATES_FAILED=$((STATS_NUM_DATES_FAILED + 1))
+        return 1
+    fi
     if [[ "${DRY_RUN,,}" != "true" ]]; then
         execute_cmd "Change ownership of final video subdir to zfile" "chown" "zfile:zfile" "${final_video_output_subdir}"
     else
@@ -470,23 +814,14 @@ process_single_date() { # Uses execute_cmd
     fi
 
     log_info "Starting rsync of images for ${date_to_process} from Armbian..."
-    local rsync_exit_code
-    execute_cmd "Rsync images" "rsync" "-rtz" "--delete" "--timeout=600" \
+    if ! run_with_retry RSYNC "Rsync images" "${RSYNC_MAX_ATTEMPTS}" "${RSYNC_RETRY_DELAY_SEC}" "${RSYNC_TIMEOUT_SEC}" "24" -- \
+        rsync -rtz --delete --timeout=600 \
         "${ARMBIAN_USER}@${ARMBIAN_IP}:${source_dir_on_armbian}" \
-        "${CURRENT_IMAGE_STAGING_DIR_FOR_TRAP}/" 
-    rsync_exit_code=$? 
-
-    if [ ${rsync_exit_code} -eq 0 ]; then
-        log_info "Rsync for ${date_to_process} completed successfully."
-    elif [ ${rsync_exit_code} -eq 24 ]; then
-        log_warn "Rsync for ${date_to_process} completed with warning code 24."
-    elif [[ "${rsync_exit_code}" -eq 20 || "${rsync_exit_code}" -eq 130 || "${rsync_exit_code}" -eq 143 ]]; then 
-        log_error "Rsync for ${date_to_process} was interrupted (signal related, code ${rsync_exit_code})."
-        return 1
-    else
-        log_error "Rsync for ${date_to_process} failed with critical code ${rsync_exit_code}."
+        "${CURRENT_IMAGE_STAGING_DIR_FOR_TRAP}/"; then
+        STATS_NUM_DATES_FAILED=$((STATS_NUM_DATES_FAILED + 1))
         return 1
     fi
+    log_info "Rsync for ${date_to_process} completed successfully."
 
     local num_files
     if [[ "${DRY_RUN,,}" == "true" ]]; then 
@@ -496,6 +831,8 @@ process_single_date() { # Uses execute_cmd
         num_files=$(find "${CURRENT_IMAGE_STAGING_DIR_FOR_TRAP}" -maxdepth 1 -type f -iname "*.jpg" | wc -l)
         log_info "Found ${num_files} JPG images in ${CURRENT_IMAGE_STAGING_DIR_FOR_TRAP} for ${date_to_process}."
     fi
+    STATS_LAST_NUM_PHOTOS=${num_files}
+    STATS_TOTAL_PHOTOS_SYNCED=$((STATS_TOTAL_PHOTOS_SYNCED + num_files))
     
     if [ "${num_files}" -eq 0 ]; then
         log_info "No images for ${date_to_process} after rsync. Skipping encoding for this date."
@@ -504,61 +841,158 @@ process_single_date() { # Uses execute_cmd
         fi
         CURRENT_IMAGE_STAGING_DIR_FOR_TRAP="" 
         CURRENT_PROCESSING_DATE_FOR_TRAP="N/A" 
+        STATS_NUM_DATES_SUCCEEDED=$((STATS_NUM_DATES_SUCCEEDED + 1))
         return 0 
     fi
 
     log_info "Starting FFmpeg encoding for ${date_to_process} to ${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}"
-    local ffmpeg_exit_code
-    execute_cmd "FFmpeg encoding" "${FFMPEG_EXE_PATH}" "-hide_banner" "-loglevel" "info" \
-        "-framerate" "${OUTPUT_FPS}" \
-        "-pattern_type" "glob" "-i" "${CURRENT_IMAGE_STAGING_DIR_FOR_TRAP}/*.jpg" \
-        "-vf" "format=nv12" \
-        "-c:v" "${VIDEO_CODEC}" \
-        "-b:v" "${VIDEO_BITRATE}" \
-        "-an" \
-        "-y" "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}" 
-    ffmpeg_exit_code=$?
-        
-    if [ ${ffmpeg_exit_code} -ne 0 ]; then
-        log_error "FFmpeg encoding for ${date_to_process} failed (Exit code: ${ffmpeg_exit_code})."
-        return 1 
+    # Decide whether to encode to tmpfs or directly to final location based on free space estimation
+    local ffmpeg_output_target="${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}"
+    local tmp_avail_kb
+    tmp_avail_kb=$(df -k --output=avail "${FFMPEG_TEMP_OUTPUT_PARENT_DIR_ON_RAMDISK}" | tail -n 1)
+    local estimated_output_kb
+    if [[ "${DRY_RUN,,}" == "true" ]]; then
+        estimated_output_kb=$(( 300 * 1024 )) # ~300MB
+    else
+        # A) bitrate-based estimate
+        local bps
+        bps=$(parse_bitrate_to_bps "${VIDEO_BITRATE}")
+        if [[ -z "${bps}" || "${bps}" -le 0 ]]; then bps=1000000; fi
+        local est_seconds=$(( (num_files + ${OUTPUT_FPS} - 1) / ${OUTPUT_FPS} ))
+        local est_bytes_rate=$(( (bps / 8) * est_seconds ))
+        # Apply headroom
+        est_bytes_rate=$(( (est_bytes_rate * OUTPUT_ESTIMATE_HEADROOM_PERMILLE) / 1000 ))
+
+        # B) input-size-based estimate (sum of JPG sizes * ratio)
+        local input_total_bytes=0
+        input_total_bytes=$(find "${CURRENT_IMAGE_STAGING_DIR_FOR_TRAP}" -maxdepth 1 -type f -iname "*.jpg" -printf "%s\n" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+        local est_bytes_input=$(( (input_total_bytes * OUTPUT_ESTIMATE_INPUT_RATIO_PERMILLE) / 1000 ))
+        # Apply headroom
+        est_bytes_input=$(( (est_bytes_input * OUTPUT_ESTIMATE_HEADROOM_PERMILLE) / 1000 ))
+
+        # Choose the larger estimate
+        local est_bytes_final=${est_bytes_rate}
+        if [[ ${est_bytes_input} -gt ${est_bytes_rate} ]]; then
+            est_bytes_final=${est_bytes_input}
+        fi
+        estimated_output_kb=$(( est_bytes_final / 1024 ))
     fi
-    log_info "FFmpeg encoding for ${date_to_process} successful: ${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}"
+    if [[ -n "${tmp_avail_kb}" && "${tmp_avail_kb}" -gt 0 && "${tmp_avail_kb}" -lt "${estimated_output_kb}" ]]; then
+        log_warn "Estimated output (~$((estimated_output_kb/1024))MB) exceeds tmpfs free ($((tmp_avail_kb/1024))MB). Will encode directly to final path."
+        ffmpeg_output_target="${final_video_file_path}"
+    fi
+
+    # If encoding directly to final path, perform pre-flight free space check on final storage
+    if [[ "${ffmpeg_output_target}" == "${final_video_file_path}" ]]; then
+        if ! execute_cmd "Ensure final video subdir exists" "mkdir" "-p" "${final_video_output_subdir}"; then
+            STATS_NUM_DATES_FAILED=$((STATS_NUM_DATES_FAILED + 1))
+            return 1
+        fi
+        local final_avail_kb
+        if [[ "${DRY_RUN,,}" == "true" ]]; then
+            final_avail_kb=$(( estimated_output_kb * 2 ))
+        else
+            final_avail_kb=$(df -k --output=avail "${final_video_output_subdir}" | tail -n 1)
+        fi
+        local required_final_kb=$(( estimated_output_kb + (10 * 1024) ))
+        if [[ "${final_avail_kb}" -lt "${required_final_kb}" ]]; then
+            log_error "Insufficient disk space in ${final_video_output_subdir} for direct-encoded video. Available: ${final_avail_kb}KB, Estimated required: ~${required_final_kb}KB."
+            STATS_NUM_DATES_FAILED=$((STATS_NUM_DATES_FAILED + 1))
+            return 1
+        fi
+    fi
+
+    # 动态估算：按最低 10 fps 处理速率（支持 120 fps 快速转码，但保守按 10 fps 估算）
+    # 示例：1.2w 张 → ceil(12000 / 10) = 1200 秒
+    local ffmpeg_timeout_this_run
+    local min_processing_fps=10
+    local suggested_timeout=$(( (num_files + min_processing_fps - 1) / min_processing_fps ))
+    # 夹在 300~2400 秒区间
+    if [[ ${suggested_timeout} -lt 300 ]]; then suggested_timeout=300; fi
+    if [[ ${suggested_timeout} -gt 2400 ]]; then suggested_timeout=2400; fi
+    ffmpeg_timeout_this_run=${suggested_timeout}
+    log_info "Dynamic timeout: frames=${num_files}, min_fps=${min_processing_fps} => ${ffmpeg_timeout_this_run}s (clamped 300-2400)"
+
+    if ! run_with_retry FFMPEG "FFmpeg encoding" "${FFMPEG_MAX_ATTEMPTS}" "${FFMPEG_RETRY_DELAY_SEC}" "${ffmpeg_timeout_this_run}" "" -- \
+        "${FFMPEG_EXE_PATH}" -hide_banner -loglevel info \
+        -hwaccel rkmpp -hwaccel_output_format drm_prime -afbc rga \
+        -framerate "${OUTPUT_FPS}" \
+        -pattern_type glob -i "${CURRENT_IMAGE_STAGING_DIR_FOR_TRAP}/*.jpg" \
+        -vf "scale_rkrga=w=1920:h=1080:format=nv12:afbc=1" \
+        -c:v "${VIDEO_CODEC}" \
+        -rc_mode CQP -qp_init "${VIDEO_QUALITY}" \
+        -profile:v main -g:v 60 \
+        -an \
+        -y "${ffmpeg_output_target}"; then
+        log_error "FFmpeg encoding for ${date_to_process} failed."
+        STATS_NUM_DATES_FAILED=$((STATS_NUM_DATES_FAILED + 1))
+        return 1
+    fi
+    log_info "FFmpeg encoding for ${date_to_process} successful: ${ffmpeg_output_target}"
 
     local min_video_size_bytes=$((${MIN_VALID_VIDEO_SIZE_KB} * 1024))
     if [[ "${DRY_RUN,,}" == "false" ]] && 
-       ([ ! -f "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}" ] || \
-        [ ! -s "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}" ] || \
-        [ "$(stat -c%s "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}")" -lt "${min_video_size_bytes}" ]); then
-        log_error "FFmpeg for ${date_to_process} produced an invalid or too small video file: ${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP} (Size: $(stat -c%s "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}" 2>/dev/null || echo 0) bytes)."
+       ([ ! -f "${ffmpeg_output_target}" ] || \
+        [ ! -s "${ffmpeg_output_target}" ] || \
+        [ "$(stat -c%s "${ffmpeg_output_target}")" -lt "${min_video_size_bytes}" ]); then
+        log_error "FFmpeg for ${date_to_process} produced an invalid or too small video file: ${ffmpeg_output_target} (Size: $(stat -c%s "${ffmpeg_output_target}" 2>/dev/null || echo 0) bytes)."
+        STATS_NUM_DATES_FAILED=$((STATS_NUM_DATES_FAILED + 1))
         return 1
     fi
-    log_info "Temporary video file for ${date_to_process} verified."
+    log_info "Encoded video for ${date_to_process} verified."
 
-    local required_space_kb temp_video_size_bytes available_space_kb
-    if [[ "${DRY_RUN,,}" == "true" ]]; then
-        temp_video_size_bytes=$((100 * 1024 * 1024)) 
+    # For PushPlus summary
+    LAST_DATE_PROCESSED="${date_to_process}"
+    LAST_FINAL_VIDEO_PATH="${final_video_file_path}"
+    if [[ "${ffmpeg_output_target}" == "${final_video_file_path}" ]]; then
+        LAST_ENCODE_DIRECT="true"
     else
-        temp_video_size_bytes=$(stat -c%s "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}")
+        LAST_ENCODE_DIRECT="false"
     fi
-    required_space_kb=$(( (temp_video_size_bytes / 1024) + (10 * 1024) )) 
-    
-    execute_cmd "Ensure final video subdir exists for df check" "mkdir" "-p" "${final_video_output_subdir}" || return 1 
-    
+
+    # Probe duration (best-effort)
     if [[ "${DRY_RUN,,}" == "true" ]]; then
-        available_space_kb=$(( required_space_kb * 2 )) 
+        STATS_LAST_VIDEO_SECONDS=$(( (STATS_LAST_NUM_PHOTOS + ${OUTPUT_FPS} - 1) / ${OUTPUT_FPS} ))
     else
-        available_space_kb=$(df -k --output=avail "${final_video_output_subdir}" | tail -n 1)
-    fi    
-
-    if [ "${available_space_kb}" -lt "${required_space_kb}" ]; then
-        log_error "Insufficient disk space in ${final_video_output_subdir} for ${date_to_process} video. Available: ${available_space_kb}KB, Required: ~${required_space_kb}KB."
-        return 1
+        STATS_LAST_VIDEO_SECONDS=$(probe_video_duration_seconds "${ffmpeg_output_target}")
     fi
-    log_info "Disk space check passed for ${final_video_output_subdir}."
+    STATS_TOTAL_OUTPUT_VIDEO_SECONDS=$((STATS_TOTAL_OUTPUT_VIDEO_SECONDS + STATS_LAST_VIDEO_SECONDS))
 
-    log_info "Copying video for ${date_to_process} to final location: ${final_video_file_path}"
-    execute_cmd "Copy video to final storage" "cp" "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}" "${final_video_file_path}" || return 1
+    # If encoded to tmpfs, ensure the final storage has enough space for copying
+    if [[ "${ffmpeg_output_target}" != "${final_video_file_path}" ]]; then
+        local required_space_kb temp_video_size_bytes available_space_kb
+        if [[ "${DRY_RUN,,}" == "true" ]]; then
+            temp_video_size_bytes=$((100 * 1024 * 1024)) 
+        else
+            temp_video_size_bytes=$(stat -c%s "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}")
+        fi
+        required_space_kb=$(( (temp_video_size_bytes / 1024) + (10 * 1024) )) 
+        
+        execute_cmd "Ensure final video subdir exists for df check" "mkdir" "-p" "${final_video_output_subdir}" || return 1 
+        
+        if [[ "${DRY_RUN,,}" == "true" ]]; then
+            available_space_kb=$(( required_space_kb * 2 )) 
+        else
+            available_space_kb=$(df -k --output=avail "${final_video_output_subdir}" | tail -n 1)
+        fi    
+
+        if [ "${available_space_kb}" -lt "${required_space_kb}" ]; then
+            log_error "Insufficient disk space in ${final_video_output_subdir} for ${date_to_process} video copy. Available: ${available_space_kb}KB, Required: ~${required_space_kb}KB."
+            STATS_NUM_DATES_FAILED=$((STATS_NUM_DATES_FAILED + 1))
+            return 1
+        fi
+        log_info "Disk space check passed for copy into ${final_video_output_subdir}."
+    fi
+
+    if [[ "${ffmpeg_output_target}" != "${final_video_file_path}" ]]; then
+        log_info "Copying video for ${date_to_process} to final location: ${final_video_file_path}"
+        if ! execute_cmd "Copy video to final storage" "cp" "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}" "${final_video_file_path}"; then
+            STATS_NUM_DATES_FAILED=$((STATS_NUM_DATES_FAILED + 1))
+            return 1
+        fi
+    else
+        log_info "Video already encoded directly to final location; skip copy."
+    fi
 
     if [[ "${DRY_RUN,,}" != "true" ]]; then # 通常，实际的文件系统更改不应在 dry run 模式下执行
 	execute_cmd "Change ownership of final video to zfile" "chown" "zfile:zfile" "${final_video_file_path}" || {
@@ -570,15 +1004,24 @@ process_single_date() { # Uses execute_cmd
         log_info "[DRY RUN] Would change ownership of ${final_video_file_path} to zfile:zfile"
     fi
 
+    if [[ "${DRY_RUN,,}" == "true" ]]; then
+        STATS_LAST_VIDEO_SIZE_BYTES=0
+    else
+        STATS_LAST_VIDEO_SIZE_BYTES=$(stat -c%s "${final_video_file_path}" 2>/dev/null || echo 0)
+    fi
+    STATS_TOTAL_OUTPUT_VIDEO_SIZE_BYTES=$((STATS_TOTAL_OUTPUT_VIDEO_SIZE_BYTES + STATS_LAST_VIDEO_SIZE_BYTES))
     log_info "Video for ${date_to_process} successfully copied (Size: $( [[ "${DRY_RUN,,}" == "false" ]] && du -h "${final_video_file_path}" | cut -f1 || echo "N/A in dry run" ))."
 
     log_info "Cleaning up ramdisk files for successfully processed date ${date_to_process}..."
-    execute_cmd "Delete temp video for ${date_to_process}" "rm" "-f" "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}"
-    FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP="" 
+    if [[ "${ffmpeg_output_target}" != "${final_video_file_path}" ]]; then
+        execute_cmd "Delete temp video for ${date_to_process}" "rm" "-f" "${FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP}"
+        FFMPEG_TEMP_VIDEO_FILE_FOR_TRAP="" 
+    fi
 
     execute_cmd "Delete staged images for ${date_to_process}" "rm" "-rf" "${CURRENT_IMAGE_STAGING_DIR_FOR_TRAP}"
     CURRENT_IMAGE_STAGING_DIR_FOR_TRAP="" 
     
+    STATS_NUM_DATES_SUCCEEDED=$((STATS_NUM_DATES_SUCCEEDED + 1))
     log_info "--- Finished processing for date: ${date_to_process} ---"
     CURRENT_PROCESSING_DATE_FOR_TRAP="N/A" 
     return 0 
@@ -629,6 +1072,17 @@ Key Configuration Variables (set near the top of the script):
 Logs are written to: ${LOG_FILE}
 When run via cron, ensure the user running the script (e.g., root) has
 permissions for all paths, SSH key access, and necessary commands.
+
+Environment overrides:
+  SCRIPT_DRY_RUN_ENV_OVERRIDE=true|false
+  SCRIPT_ENABLE_LOCKING_ENV_OVERRIDE=true|false
+  SCRIPT_SYSLOG_LOG_ENV_OVERRIDE=true|false
+  SCRIPT_DEBUG_TRACE_ENV_OVERRIDE=true|false
+  ENABLE_HARD_TIMEOUTS_ENV_OVERRIDE=true|false
+  ENABLE_PUSHPLUS_ENV_OVERRIDE=true|false
+  PUSHPLUS_TOKEN_ENV_OVERRIDE=your_token_here
+  OUTPUT_ESTIMATE_INPUT_RATIO_PERMILLE_ENV_OVERRIDE=100   # 输入尺寸估算比例(千分比)
+  OUTPUT_ESTIMATE_HEADROOM_PERMILLE_ENV_OVERRIDE=120      # 估算裕量(千分比)
 EOF
     exit 0
 }
@@ -681,6 +1135,7 @@ main_control_flow() {
     fi
 
     rotate_log 
+    START_EPOCH=$(date +%s)
     log_info "================== Daily Photo-to-Video Script (v${SCRIPT_VERSION}) Started =================="
     log_info "Effective RUN_ID: ${RUN_ID}"
     log_info "Running as user: $(whoami). Effective DRY_RUN: ${DRY_RUN}. Locking enabled: ${ENABLE_LOCKING}."
@@ -689,27 +1144,50 @@ main_control_flow() {
     fi
     
     check_dependencies
-    setup_ramdisk_if_needed 
     determine_target_config 
 
-    local date_to_process_selected
-    if ! date_to_process_selected=$(select_date_to_process); then 
-        log_info "No date selected for processing based on current checks. Exiting."
-        log_info "================== Daily Photo-to-Video Script (v${SCRIPT_VERSION}) Finished (No Action) =================="
-        exit 0 
-    fi
-    
-    CURRENT_PROCESSING_DATE_FOR_TRAP="${date_to_process_selected}" 
-    log_info "Date selected for processing in this run: ${date_to_process_selected}"
+    # 循环补齐历史未处理的日期，直至没有可处理的日期或达到安全上限
+    local processed_dates_count=0
+    local loop_guard_max="${MAX_CATCH_UP_DAYS}"
+    if [[ -z "${loop_guard_max}" || "${loop_guard_max}" -le 0 ]]; then loop_guard_max=30; fi
+    local ramdisk_prepared_for_run=false
 
-    if process_single_date "${date_to_process_selected}"; then
-        log_info "Successfully completed all operations for date: ${date_to_process_selected}."
-    else
-        log_error "Overall processing failed for date: ${date_to_process_selected}. See logs for specific errors."
-        exit 1 
-    fi
-    
-    log_info "================== Daily Photo-to-Video Script (v${SCRIPT_VERSION}) Finished Successfully =================="
+    while :; do
+        local date_to_process_selected
+        if ! date_to_process_selected=$(select_date_to_process); then 
+            if [[ ${processed_dates_count} -eq 0 ]]; then
+                log_info "No date selected for processing based on current checks. Exiting."
+                log_info "================== Daily Photo-to-Video Script (v${SCRIPT_VERSION}) Finished (No Action) =================="
+            else
+                log_info "No more dates to process in this run. Total processed: ${processed_dates_count}."
+                log_info "================== Daily Photo-to-Video Script (v${SCRIPT_VERSION}) Finished Successfully =================="
+            fi
+            break
+        fi
+
+        # 仅在确定有可处理日期后，才准备（挂载）ramdisk；且每次运行只准备一次
+        if [[ "${ramdisk_prepared_for_run}" != "true" ]]; then
+            setup_ramdisk_if_needed
+            ramdisk_prepared_for_run=true
+        fi
+
+        CURRENT_PROCESSING_DATE_FOR_TRAP="${date_to_process_selected}" 
+        log_info "Date selected for processing in this run: ${date_to_process_selected}"
+
+        if process_single_date "${date_to_process_selected}"; then
+            processed_dates_count=$((processed_dates_count + 1))
+            log_info "Successfully completed all operations for date: ${date_to_process_selected}. (Processed so far: ${processed_dates_count})"
+        else
+            log_error "Overall processing failed for date: ${date_to_process_selected}. See logs for specific errors."
+            exit 1 
+        fi
+
+        if [[ ${processed_dates_count} -ge ${loop_guard_max} ]]; then
+            log_warn "Reached loop guard limit (${loop_guard_max}). Stopping further catch-up in this run."
+            log_info "================== Daily Photo-to-Video Script (v${SCRIPT_VERSION}) Finished Successfully =================="
+            break
+        fi
+    done
 }
 
 # --- Script Entry Point ---
