@@ -1,0 +1,175 @@
+# ==============================================================================
+# camera-capture Web UI —— php-fpm + nginx
+#
+# 快速开始：
+#   mkdir -p secrets
+#   php -r "echo password_hash('你的强密码', PASSWORD_DEFAULT), PHP_EOL;" > secrets/password_hash.txt
+#   docker compose up -d
+#   打开 http://<主机>:28080/login.php
+#
+# 约定：
+#   - 每个变量都写成 ${VAR:-默认值}：不改就是默认值；想改就放进同目录的 .env。
+#     （.env.example 里列了全部变量，复制成 .env 再改即可。）
+#   - 本 UI **只读**，不需要写照片目录，所以 capture 用 :ro 挂载更安全。
+#   - 代码目录也用 :ro 挂载；缩略图缓存写在 GALLERY_CACHE_DIR（容器内可写）。
+#   - ⚠️ 唯独密码哈希**不要**放进 .env：compose 会对 .env 做变量插值，
+#     bcrypt 哈希里的 `$` 会被吞掉，导致密码正确却无法登录。见下面 secrets 说明。
+# ==============================================================================
+
+services:
+  php:
+    image: phpdockerio/php:8.4-fpm
+    container_name: camera-php
+    restart: unless-stopped
+    volumes:
+      # 项目代码目录（只读；本 UI 不写代码目录）
+      - ${GALLERY_CODE_DIR:-/opt/camera/web-ui}:/var/www/html:ro
+      # 只读挂载 capture 文件夹（照片库）
+      - ${GALLERY_CAPTURE_HOST_DIR:-/opt/camera/capture}:/var/www/capture:ro
+      # 只读挂载采集端状态文件
+      - ${GALLERY_STATUS_HOST_FILE:-/opt/camera/status.json}:/var/www/status.json:ro
+      # 共享 Unix Socket 目录，用于与 Nginx 通信
+      - php-socket:/var/run/php
+    secrets:
+      # 密码哈希以文件形式挂进容器：/run/secrets/gallery_password_hash
+      - gallery_password_hash
+    environment:
+      - PHP_FPM_LISTEN=/var/run/php/php-fpm.sock
+
+      # ----------------------------------------------------------------------
+      # 1. 访问密码（必填：不设置则任何人都无法登录）
+      #
+      #    内容来自 secrets/password_hash.txt（本文件同目录），准备方式：
+      #      mkdir -p secrets
+      #      php -r "echo password_hash('你的强密码', PASSWORD_DEFAULT), PHP_EOL;" \
+      #        > secrets/password_hash.txt
+      #
+      #    为什么用文件而不是环境变量：bcrypt 哈希里有 `$`，而 compose 对 .env
+      #    做变量插值会把 `$2y$12$abc...` 解析成残缺的 `$$2y$$12`（尾部被吞），
+      #    导致"密码明明对却登不进去"。secrets 直接挂文件，不经过任何插值。
+      #
+      #    也可以直接写 web-ui/config.php 的 password_hash（别提交真实哈希）。
+      # ----------------------------------------------------------------------
+      - GALLERY_PASSWORD_HASH_FILE=/run/secrets/gallery_password_hash
+
+      # ----------------------------------------------------------------------
+      # 2. 照片目录与传输方式（proxy / direct 共用同一个目录）
+      # ----------------------------------------------------------------------
+      # 照片库根目录（容器内路径）。proxy 模式下这是唯一需要的路径配置。
+      - GALLERY_CAPTURES_DIR=${GALLERY_CAPTURES_DIR:-/var/www/capture}
+      # proxy = 经 image.php 鉴权后流式输出（默认，推荐）；direct = Web 服务器直接对外
+      - GALLERY_IMAGE_MODE=${GALLERY_IMAGE_MODE:-proxy}
+      # 仅 direct 模式使用：captures_dir 对应的 URL 前缀
+      - GALLERY_WEB_PATH=${GALLERY_WEB_PATH:-/captures}
+
+      # ----------------------------------------------------------------------
+      # 3. 缩略图与缓存
+      # ----------------------------------------------------------------------
+      # 缩略图/统计缓存目录。代码目录是只读挂载，所以必须指向容器内可写路径。
+      - GALLERY_CACHE_DIR=${GALLERY_CACHE_DIR:-/tmp/gallery-cache}
+      # 文件缓存默认有效期（秒）
+      - GALLERY_CACHE_TTL=${GALLERY_CACHE_TTL:-3600}
+      # 缩略图最长边（像素）与 JPEG 质量；想省流量就调小 / 调低
+      - GALLERY_THUMB_MAX_DIMENSION=${GALLERY_THUMB_MAX_DIMENSION:-420}
+      - GALLERY_THUMB_QUALITY=${GALLERY_THUMB_QUALITY:-78}
+
+      # ----------------------------------------------------------------------
+      # 4. 会话与登录
+      # ----------------------------------------------------------------------
+      # 会话 Cookie 名（HTTPS 下会自动加 __Host- 前缀）
+      - GALLERY_SESSION_NAME=${GALLERY_SESSION_NAME:-PhotoGallerySession}
+      # 空闲超时 / 绝对超时（秒），0 = 不限制
+      - GALLERY_SESSION_IDLE_TIMEOUT=${GALLERY_SESSION_IDLE_TIMEOUT:-1800}
+      - GALLERY_SESSION_ABSOLUTE_TIMEOUT=${GALLERY_SESSION_ABSOLUTE_TIMEOUT:-43200}
+      # 把会话绑定到客户端 IP（更严格，但换网络会掉线）
+      - GALLERY_BIND_SESSION_TO_IP=${GALLERY_BIND_SESSION_TO_IP:-false}
+      # 登录失败限流：window 内超过 attempts 次即锁定 lockout 秒
+      - GALLERY_LOGIN_MAX_ATTEMPTS=${GALLERY_LOGIN_MAX_ATTEMPTS:-5}
+      - GALLERY_LOGIN_LOCKOUT_SECONDS=${GALLERY_LOGIN_LOCKOUT_SECONDS:-300}
+
+      # ----------------------------------------------------------------------
+      # 5. 接口限流
+      # ----------------------------------------------------------------------
+      # 普通 API：每 IP 每 api_rate_window 秒最多 api_rate_limit 次
+      # （实时监控轮询最密约 1 次/秒 = 60 次/分，别把上限压到 60 以下）
+      - GALLERY_API_RATE_LIMIT=${GALLERY_API_RATE_LIMIT:-240}
+      - GALLERY_API_RATE_WINDOW=${GALLERY_API_RATE_WINDOW:-60}
+      # 运维面板「刷新」（全量重算统计）每 IP 每分钟次数
+      - GALLERY_OPS_REFRESH_RATE_LIMIT=${GALLERY_OPS_REFRESH_RATE_LIMIT:-6}
+
+      # ----------------------------------------------------------------------
+      # 6. 前端默认行为（只影响新访客；用户改过之后以浏览器 cookie 为准）
+      # ----------------------------------------------------------------------
+      # 打开页面默认标签：gallery（相册）/ ops（运维）
+      - GALLERY_DEFAULT_VIEW=${GALLERY_DEFAULT_VIEW:-gallery}
+      # 轮播/查看器初始倍速：1 / 2 / 4 / 8 / 16 / 32（1x = 实时）
+      - GALLERY_SLIDESHOW_SPEED=${GALLERY_SLIDESHOW_SPEED:-1}
+      # 是否显示「下载图片」
+      - GALLERY_DOWNLOAD_ENABLED=${GALLERY_DOWNLOAD_ENABLED:-true}
+      # 默认外观：dark / light
+      - GALLERY_THEME_MODE=${GALLERY_THEME_MODE:-dark}
+      # 默认配色：blue / teal / violet / amber / rose / green
+      - GALLERY_THEME_ACCENT=${GALLERY_THEME_ACCENT:-blue}
+
+      # ----------------------------------------------------------------------
+      # 7. 实时监控（自适应轮询边界，毫秒）
+      # ----------------------------------------------------------------------
+      - GALLERY_MONITOR_INITIAL_INTERVAL=${GALLERY_MONITOR_INITIAL_INTERVAL:-1500}
+      - GALLERY_MONITOR_MIN_INTERVAL=${GALLERY_MONITOR_MIN_INTERVAL:-1000}
+      - GALLERY_MONITOR_MAX_INTERVAL=${GALLERY_MONITOR_MAX_INTERVAL:-8000}
+
+      # ----------------------------------------------------------------------
+      # 8. 运维面板
+      # ----------------------------------------------------------------------
+      # 采集端写出的状态文件（capture.py 默认写 LOG_DIR/health.json）
+      - GALLERY_HEALTH_FILE=${GALLERY_HEALTH_FILE:-/var/www/status.json}
+      # 心跳超过这个秒数判定为「已过期」
+      - GALLERY_HEALTH_STALE_SECONDS=${GALLERY_HEALTH_STALE_SECONDS:-900}
+      # 磁盘占用超过该百分比即告警
+      - GALLERY_DISK_WARN_PERCENT=${GALLERY_DISK_WARN_PERCENT:-85}
+      # 每日张数图表窗口（天）与统计缓存 TTL（秒）
+      - GALLERY_STATS_RECENT_DAYS=${GALLERY_STATS_RECENT_DAYS:-31}
+      - GALLERY_STATS_CACHE_TTL=${GALLERY_STATS_CACHE_TTL:-3600}
+
+      # ----------------------------------------------------------------------
+      # 9. 安全 / 环境
+      # ----------------------------------------------------------------------
+      # 只有在你自己控制的反向代理后面才打开。本 compose 里 nginx 就是边缘、
+      # 直接对外，所以默认 false；若前面还有一层 HTTPS 反代再改成 true。
+      - GALLERY_TRUST_PROXY=${GALLERY_TRUST_PROXY:-false}
+      # 采集设备时区：界面显示的派生时间以它为准（如 Asia/Shanghai）
+      - GALLERY_TIMEZONE=${GALLERY_TIMEZONE:-Asia/Shanghai}
+    networks:
+      - camera-net
+
+  nginx:
+    image: nginx:stable
+    container_name: camera-nginx
+    restart: unless-stopped
+    ports:
+      - "${GALLERY_HTTP_PORT:-28080}:80"
+    volumes:
+      # 项目代码目录（Nginx 需要能读取静态文件）
+      - ${GALLERY_CODE_DIR:-/opt/camera/web-ui}:/var/www/html:ro
+      # 只读挂载 capture 文件夹（direct 模式下才需要由 Nginx 直接提供）
+      - ${GALLERY_CAPTURE_HOST_DIR:-/opt/camera/capture}:/var/www/capture:ro
+      # 自定义 Nginx 配置
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      # 共享 Unix Socket 目录
+      - php-socket:/var/run/php
+    depends_on:
+      - php
+    networks:
+      - camera-net
+
+secrets:
+  # 文件内容是那一行纯 bcrypt 哈希（本文件同目录下的 secrets/password_hash.txt）
+  gallery_password_hash:
+    file: ./secrets/password_hash.txt
+
+volumes:
+  php-socket:
+
+networks:
+  camera-net:
+    driver: bridge
