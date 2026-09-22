@@ -1,0 +1,166 @@
+.login-page {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 22px;
+}
+
+.login-card {
+    width: 100%;
+    max-width: 408px;
+    padding: 30px 30px 26px;
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+    animation: loginIn 0.55s var(--spring);
+}
+
+@keyframes loginIn {
+    from {
+        opacity: 0;
+        transform: translateY(18px) scale(0.97);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+.login-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.login-brand {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+}
+
+.login-mark {
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    background-image: linear-gradient(140deg, var(--accent), var(--accent-2));
+    color: var(--on-accent);
+    box-shadow: 0 10px 24px -10px var(--accent);
+}
+
+.login-mark svg {
+    width: 20px;
+    height: 20px;
+    fill: currentColor;
+}
+
+.login-card h1 {
+    margin: 0;
+    font-size: 1.22rem;
+    font-weight: 680;
+    letter-spacing: -0.01em;
+}
+
+.login-subtitle {
+    margin: 6px 0 22px;
+    font-size: 0.9rem;
+    color: var(--text-dim);
+}
+
+.login-card .field-label {
+    display: block;
+    margin-bottom: 7px;
+    font-size: 0.82rem;
+    font-weight: 620;
+    color: var(--text-mute);
+}
+
+.password-field {
+    position: relative;
+}
+
+.password-field input {
+    padding-right: 66px;
+}
+
+.password-toggle {
+    position: absolute;
+    top: 50%;
+    right: 7px;
+    transform: translateY(-50%);
+    height: 26px;
+    padding: 0 0.6rem;
+    border: none;
+    border-radius: 8px;
+    background: none;
+    color: var(--text-dim);
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.password-toggle:hover {
+    background-color: var(--surface-2);
+    color: var(--text);
+}
+
+.caps-hint {
+    margin: 9px 0 0;
+    font-size: 0.8rem;
+    color: var(--warn);
+}
+
+.login-card .btn-block {
+    margin-top: 18px;
+    height: 42px;
+    font-size: 0.95rem;
+}
+
+.login-error {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 14px 0 0;
+    padding: 10px 13px;
+    border: 1px solid rgba(251, 113, 133, 0.3);
+    border-radius: var(--radius-sm);
+    background-color: var(--danger-soft);
+    color: var(--danger);
+    font-size: 0.86rem;
+    animation: shake 0.4s var(--ease);
+}
+
+@keyframes shake {
+    0%,
+    100% {
+        transform: translateX(0);
+    }
+    20% {
+        transform: translateX(-5px);
+    }
+    40% {
+        transform: translateX(5px);
+    }
+    60% {
+        transform: translateX(-3px);
+    }
+    80% {
+        transform: translateX(3px);
+    }
+}
+
+.login-footer {
+    margin-top: 22px;
+    text-align: center;
+    font-size: 0.78rem;
+    color: var(--text-mute);
+}
+
+@media (max-width: 420px) {
+    .login-card {
+        padding: 24px 22px;
+    }
+}

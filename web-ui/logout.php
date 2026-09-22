@@ -1,43 +1,28 @@
 <?php
-require_once 'config.php'; // 包含配置并启动会话
+use Gallery\Security\Auth;
+use Gallery\Security\Csrf;
+use Gallery\Security\Headers;
 
-// 仅允许 POST 请求以防 CSRF（在无CSRF token前提下也能拦截GET触发）
+require __DIR__ . '/src/bootstrap.php';
+
+Headers::apply('page');
+
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    if (!headers_sent()) {
-        header('HTTP/1.1 405 Method Not Allowed');
-        header('Allow: POST');
-        header('Cache-Control: no-store');
-        header('Content-Type: text/plain; charset=UTF-8');
-    }
+    http_response_code(405);
+    header('Allow: POST');
+    header('Content-Type: text/plain; charset=utf-8');
     echo 'Method Not Allowed';
     exit;
 }
 
-// CSRF 校验
-$token = $_POST['csrf_token'] ?? '';
-if (!function_exists('validate_csrf_token')) {
-    if (!headers_sent()) {
-        header('HTTP/1.1 500 Internal Server Error');
-        header('Cache-Control: no-store');
-        header('Content-Type: text/plain; charset=UTF-8');
-    }
-    echo 'Server CSRF validator missing';
-    exit;
-}
-if (!validate_csrf_token($token)) {
-    if (!headers_sent()) {
-        header('HTTP/1.1 403 Forbidden');
-        header('Cache-Control: no-store');
-        header('Content-Type: text/plain; charset=UTF-8');
-    }
+if (!Csrf::validate(isset($_POST['csrf_token']) ? $_POST['csrf_token'] : null)) {
+    http_response_code(403);
+    header('Content-Type: text/plain; charset=utf-8');
     echo 'Invalid CSRF token';
     exit;
 }
 
-destroy_authentication_session(); // 调用销毁会话的函数
+Auth::logout();
 
-// 303 重定向至登录页
-header('Cache-Control: no-store');
-header('Location: login.php?logged_out=true', true, 303);
+header('Location: login.php?logged_out=1', true, 303);
 exit;
-?>

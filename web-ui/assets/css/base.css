@@ -1,0 +1,602 @@
+/* ==========================================================================
+   Design tokens
+   ========================================================================== */
+
+:root {
+    color-scheme: dark;
+
+    --bg: #07080b;
+    --bg-glow-1: rgba(88, 128, 255, 0.10);
+    --bg-glow-2: rgba(160, 110, 255, 0.08);
+
+    --surface: #12141b;
+    --surface-2: #1a1d27;
+    --surface-2-hover: #222634;
+    --glass: rgba(10, 12, 17, 0.72);
+
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.18);
+
+    --text: #eceff5;
+    --text-dim: #98a1b2;
+    --text-mute: #69717f;
+
+    --accent: #6aa2ff;
+    --accent-hover: #8bb8ff;
+    --accent-soft: rgba(106, 162, 255, 0.14);
+    --accent-2: #a78bfa;
+    --on-accent: #05070c;
+
+    --ok: #3ddc97;
+    --ok-soft: rgba(61, 220, 151, 0.12);
+    --warn: #fbbf24;
+    --warn-soft: rgba(251, 191, 36, 0.12);
+    --danger: #fb7185;
+    --danger-soft: rgba(251, 113, 133, 0.12);
+
+    --sk-shine: rgba(255, 255, 255, 0.07);
+    --hover-tint: rgba(255, 255, 255, 0.06);
+
+    --radius-lg: 20px;
+    --radius: 14px;
+    --radius-sm: 10px;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+    --shadow: 0 28px 56px -28px rgba(0, 0, 0, 0.9), 0 2px 8px rgba(0, 0, 0, 0.45);
+
+    --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --spring: cubic-bezier(0.34, 1.32, 0.5, 1);
+
+    --dur-1: 0.16s;
+    --dur-2: 0.28s;
+    --dur-3: 0.5s;
+
+    --bar-h: 58px;
+}
+
+[data-theme='light'] {
+    color-scheme: light;
+
+    --bg: #f5f6f9;
+    --bg-glow-1: rgba(88, 128, 255, 0.16);
+    --bg-glow-2: rgba(160, 110, 255, 0.12);
+
+    --surface: #ffffff;
+    --surface-2: #eef0f5;
+    --surface-2-hover: #e4e7ee;
+    --glass: rgba(255, 255, 255, 0.78);
+
+    --border: rgba(15, 23, 42, 0.09);
+    --border-strong: rgba(15, 23, 42, 0.2);
+
+    --text: #0f172a;
+    --text-dim: #5a6474;
+    --text-mute: #8b93a3;
+
+    --accent: #2f6fed;
+    --accent-hover: #1f5bd8;
+    --accent-soft: rgba(47, 111, 237, 0.1);
+    --accent-2: #7c5cff;
+    --on-accent: #ffffff;
+
+    --ok: #12a171;
+    --ok-soft: rgba(18, 161, 113, 0.1);
+    --warn: #c2820a;
+    --warn-soft: rgba(194, 130, 10, 0.12);
+    --danger: #dc2f4a;
+    --danger-soft: rgba(220, 47, 74, 0.1);
+
+    --sk-shine: rgba(15, 23, 42, 0.05);
+    --hover-tint: rgba(15, 23, 42, 0.04);
+
+    --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
+    --shadow: 0 28px 56px -30px rgba(15, 23, 42, 0.3), 0 2px 8px rgba(15, 23, 42, 0.06);
+}
+
+/* --------------------------------------------------------------------------
+   Accent palettes
+   `blue` is the default defined above; these override only the accent tokens.
+   Every palette has a dark AND a light variant, so changing the accent never
+   disturbs the light/dark mode — and vice versa.
+   -------------------------------------------------------------------------- */
+
+[data-accent='teal'] {
+    --accent: #2dd4bf;
+    --accent-hover: #5eead4;
+    --accent-soft: rgba(45, 212, 191, 0.14);
+    --accent-2: #38bdf8;
+    --on-accent: #04201c;
+}
+
+[data-accent='violet'] {
+    --accent: #a78bfa;
+    --accent-hover: #c4b5fd;
+    --accent-soft: rgba(167, 139, 250, 0.16);
+    --accent-2: #f472b6;
+    --on-accent: #14071f;
+}
+
+[data-accent='amber'] {
+    --accent: #fbbf24;
+    --accent-hover: #fcd34d;
+    --accent-soft: rgba(251, 191, 36, 0.15);
+    --accent-2: #fb923c;
+    --on-accent: #21160a;
+}
+
+[data-accent='rose'] {
+    --accent: #fb7185;
+    --accent-hover: #fda4af;
+    --accent-soft: rgba(251, 113, 133, 0.15);
+    --accent-2: #c084fc;
+    --on-accent: #2a0a12;
+}
+
+[data-accent='green'] {
+    --accent: #3ddc97;
+    --accent-hover: #6ee7b7;
+    --accent-soft: rgba(61, 220, 151, 0.14);
+    --accent-2: #22d3ee;
+    --on-accent: #052018;
+}
+
+[data-theme='light'][data-accent='teal'] {
+    --accent: #0d9488;
+    --accent-hover: #0f766e;
+    --accent-soft: rgba(13, 148, 136, 0.1);
+    --accent-2: #0891b2;
+    --on-accent: #ffffff;
+}
+
+[data-theme='light'][data-accent='violet'] {
+    --accent: #7c3aed;
+    --accent-hover: #6d28d9;
+    --accent-soft: rgba(124, 58, 237, 0.1);
+    --accent-2: #db2777;
+    --on-accent: #ffffff;
+}
+
+[data-theme='light'][data-accent='amber'] {
+    --accent: #b45309;
+    --accent-hover: #92400e;
+    --accent-soft: rgba(180, 83, 9, 0.1);
+    --accent-2: #ea580c;
+    --on-accent: #ffffff;
+}
+
+[data-theme='light'][data-accent='rose'] {
+    --accent: #e11d48;
+    --accent-hover: #be123c;
+    --accent-soft: rgba(225, 29, 72, 0.1);
+    --accent-2: #9333ea;
+    --on-accent: #ffffff;
+}
+
+[data-theme='light'][data-accent='green'] {
+    --accent: #059669;
+    --accent-hover: #047857;
+    --accent-soft: rgba(5, 150, 105, 0.1);
+    --accent-2: #0891b2;
+    --on-accent: #ffffff;
+}
+
+/* ==========================================================================
+   Reset / base
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+[hidden] {
+    display: none !important;
+}
+
+html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+    background-color: var(--bg);
+}
+
+html,
+body {
+    min-height: 100%;
+}
+
+body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+        'PingFang SC', 'Microsoft YaHei', sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--text);
+    background-color: var(--bg);
+    background-image: radial-gradient(1200px 700px at 12% -12%, var(--bg-glow-1), transparent 70%),
+        radial-gradient(900px 600px at 105% 8%, var(--bg-glow-2), transparent 70%);
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+    transition: background-color var(--dur-3) var(--ease), color var(--dur-3) var(--ease);
+}
+
+body.no-scroll {
+    overflow: hidden;
+}
+
+img {
+    max-width: 100%;
+}
+
+button,
+input {
+    font: inherit;
+    color: inherit;
+}
+
+::selection {
+    background: var(--accent-soft);
+}
+
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border: 3px solid transparent;
+    border-radius: 99px;
+    background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--text-mute);
+    background-clip: content-box;
+}
+
+:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* ==========================================================================
+   Buttons
+   ========================================================================== */
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.45rem;
+    height: 38px;
+    padding: 0 0.95rem;
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    background-color: var(--surface-2);
+    color: var(--text);
+    font-size: 0.9rem;
+    font-weight: 520;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease),
+        transform var(--dur-1) var(--ease), color var(--dur-1) var(--ease), opacity var(--dur-1) var(--ease);
+}
+
+.btn:hover:not(:disabled) {
+    background-color: var(--surface-2-hover);
+    border-color: var(--border-strong);
+}
+
+.btn:active:not(:disabled) {
+    transform: scale(0.975);
+}
+
+.btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.btn-accent {
+    background-color: var(--accent);
+    border-color: transparent;
+    color: var(--on-accent);
+    font-weight: 640;
+}
+
+.btn-accent:hover:not(:disabled) {
+    background-color: var(--accent-hover);
+}
+
+.btn-ghost {
+    background-color: transparent;
+}
+
+.btn-ghost:hover:not(:disabled) {
+    background-color: var(--surface-2);
+}
+
+.btn-danger {
+    color: var(--danger);
+    border-color: rgba(251, 113, 133, 0.3);
+    background-color: var(--danger-soft);
+}
+
+.btn-danger:hover:not(:disabled) {
+    background-color: rgba(251, 113, 133, 0.2);
+    border-color: rgba(251, 113, 133, 0.5);
+}
+
+.btn-block {
+    width: 100%;
+}
+
+.btn svg {
+    width: 16px;
+    height: 16px;
+    fill: currentColor;
+}
+
+/* ==========================================================================
+   Inputs
+   ========================================================================== */
+
+.input,
+input[type='date'],
+input[type='text'],
+input[type='password'] {
+    height: 38px;
+    padding: 0 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    background-color: var(--surface);
+    color: var(--text);
+    font-size: 0.95rem;
+    transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
+}
+
+.input:focus,
+input[type='date']:focus,
+input[type='text']:focus,
+input[type='password']:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* ==========================================================================
+   Segmented control
+   ========================================================================== */
+
+.seg {
+    position: relative;
+    display: inline-flex;
+    padding: 3px;
+    border: 1px solid var(--border);
+    border-radius: 13px;
+    background-color: var(--surface);
+}
+
+.seg-thumb {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    height: calc(100% - 6px);
+    border-radius: 10px;
+    background-color: var(--surface-2);
+    border: 1px solid var(--border);
+    transition: transform var(--dur-3) var(--spring), width var(--dur-3) var(--spring);
+    pointer-events: none;
+}
+
+.seg-btn {
+    position: relative;
+    z-index: 1;
+    height: 32px;
+    padding: 0 0.95rem;
+    border: none;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    font-weight: 560;
+    cursor: pointer;
+    transition: color var(--dur-2) var(--ease);
+}
+
+.seg-btn:hover {
+    color: var(--text);
+}
+
+.seg-btn[aria-selected='true'] {
+    color: var(--text);
+}
+
+/* ==========================================================================
+   Pills / badges
+   ========================================================================== */
+
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    height: 26px;
+    padding: 0 0.65rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 620;
+    color: var(--text-dim);
+    background-color: var(--surface-2);
+    transition: color var(--dur-2) var(--ease), background-color var(--dur-2) var(--ease),
+        border-color var(--dur-2) var(--ease);
+}
+
+.pill::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+.pill-ok {
+    color: var(--ok);
+    background-color: var(--ok-soft);
+    border-color: rgba(61, 220, 151, 0.28);
+}
+
+.pill-warn {
+    color: var(--warn);
+    background-color: var(--warn-soft);
+    border-color: rgba(251, 191, 36, 0.28);
+}
+
+.pill-danger {
+    color: var(--danger);
+    background-color: var(--danger-soft);
+    border-color: rgba(251, 113, 133, 0.28);
+}
+
+.pill-mute {
+    color: var(--text-mute);
+}
+
+.pill-live::before {
+    animation: pulse 2s var(--ease) infinite;
+}
+
+@keyframes pulse {
+    0%,
+    100% {
+        opacity: 1;
+        transform: scale(1);
+    }
+    50% {
+        opacity: 0.45;
+        transform: scale(0.7);
+    }
+}
+
+/* ==========================================================================
+   Surfaces
+   ========================================================================== */
+
+.card {
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    transition: border-color var(--dur-2) var(--ease), background-color var(--dur-2) var(--ease);
+}
+
+.skeleton {
+    position: relative;
+    overflow: hidden;
+    background-color: var(--surface-2);
+}
+
+.skeleton::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background-image: linear-gradient(90deg, transparent, var(--sk-shine), transparent);
+    animation: shimmer 1.5s infinite;
+}
+
+@keyframes shimmer {
+    100% {
+        transform: translateX(100%);
+    }
+}
+
+/* ==========================================================================
+   Small helpers
+   ========================================================================== */
+
+.row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+}
+
+.spacer {
+    flex: 1 1 auto;
+}
+
+.mono {
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.86em;
+}
+
+.muted {
+    color: var(--text-dim);
+}
+
+.stat-value {
+    font-variant-numeric: tabular-nums;
+    font-weight: 680;
+    letter-spacing: -0.02em;
+}
+
+.icon-button {
+    display: grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    background-color: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
+        border-color var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+
+.icon-button:hover {
+    background-color: var(--surface-2);
+    color: var(--text);
+    border-color: var(--border-strong);
+}
+
+.icon-button:active {
+    transform: scale(0.94);
+}
+
+.icon-button svg {
+    width: 17px;
+    height: 17px;
+    fill: currentColor;
+}
+
+.theme-toggle .icon-moon {
+    display: none;
+}
+
+[data-theme='light'] .theme-toggle .icon-sun {
+    display: none;
+}
+
+[data-theme='light'] .theme-toggle .icon-moon {
+    display: block;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    html {
+        scroll-behavior: auto;
+    }
+
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+    }
+}
