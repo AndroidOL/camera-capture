@@ -1,6 +1,8 @@
 <?php
 namespace Gallery;
 
+use Gallery\Support\FileCache;
+
 final class OpsMonitor
 {
     private $library;
@@ -12,20 +14,81 @@ final class OpsMonitor
 
     public function overview(bool $refresh = false): array
     {
-        $service = $this->service();
-        $storage = $this->storage();
-        $security = $this->security();
+        $cacheKey = 'ops_overview:' . $this->library->baseDir();
 
+        /* 运维面板会被反复切换进入；磁盘探测（尤其是网络/FUSE 挂载）可能很慢，
+           因此整块结果做短 TTL 缓存，让"回到运维页"始终是即时的。 */
+        if (!$refresh) {
+            $cached = FileCache::get($cacheKey, 'ops');
+            if (is_array($cached)) {
+                $cached['from_cache'] = true;
+                return $cached;
+            }
+        }
+
+        try {
+            $service = $this->service();
+            $storage = $this->storage();
+            $security = $this->security();
+
+            try {
+                $library = $this->library->libraryStats($refresh);
+            } catch (\Throwable $e) {
+                error_log('[gallery] library stats failed: ' . $e->getMessage());
+                $library = $this->emptyLibraryStats();
+                $library['warnings'] = ['照片库统计失败：' . $e->getMessage()];
+            }
+
+            $warnings = array_merge(
+                isset($security['warnings']) ? $security['warnings'] : [],
+                isset($storage['warnings']) ? $storage['warnings'] : [],
+                isset($service['warnings']) ? $service['warnings'] : [],
+                isset($library['warnings']) ? $library['warnings'] : []
+            );
+
+            $payload = [
+                'service' => $service,
+                'storage' => $storage,
+                'library' => $library,
+                'security' => $security,
+                'warnings' => $warnings,
+                'generated_at' => time(),
+                'from_cache' => false,
+                'degraded' => !empty($library['warnings']),
+            ];
+
+            FileCache::set($cacheKey, $payload, max(5, Config::getInt('ops_cache_ttl', 20)), 'ops');
+            return $payload;
+        } catch (\Throwable $e) {
+            /* 极端情况下（磁盘/健康文件异常）退回上一次成功结果，面板至少还能看 */
+            error_log('[gallery] ops overview failed: ' . $e->getMessage());
+            $stale = FileCache::getStale($cacheKey, 'ops');
+            if (is_array($stale)) {
+                $stale['from_cache'] = true;
+                $stale['degraded'] = true;
+                $stale['warnings'] = isset($stale['warnings']) && is_array($stale['warnings'])
+                    ? $stale['warnings']
+                    : [];
+                $stale['warnings'][] = '本次刷新失败，展示的是上一次成功结果。';
+                return $stale;
+            }
+            throw $e;
+        }
+    }
+
+    private function emptyLibraryStats(): array
+    {
         return [
-            'service' => $service,
-            'storage' => $storage,
-            'library' => $this->library->libraryStats($refresh),
-            'security' => $security,
-            'warnings' => array_merge(
-                $security['warnings'],
-                $storage['warnings'],
-                $service['warnings']
-            ),
+            'months' => 0,
+            'dates' => 0,
+            'total_files' => 0,
+            'total_bytes' => 0,
+            'earliest' => null,
+            'latest' => null,
+            'by_month' => [],
+            'recent_days' => [],
+            'window_days' => max(1, Config::getInt('stats_recent_days', 31)),
+            'computed_at' => time(),
         ];
     }
 

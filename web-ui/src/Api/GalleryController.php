@@ -23,6 +23,17 @@ final class GalleryController
         return ['latestDate' => $this->library->latestDate()];
     }
 
+    /**
+     * 首屏只需要日期上下界；合并成一个请求，少一次网络往返。
+     */
+    public function getDateBounds(array $query): array
+    {
+        return [
+            'earliestDate' => $this->library->earliestDate(),
+            'latestDate' => $this->library->latestDate(),
+        ];
+    }
+
     public function getAvailableDates(array $query): array
     {
         return ['availableDates' => $this->library->availableDates()];

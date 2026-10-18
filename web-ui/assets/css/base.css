@@ -1,110 +1,109 @@
 /* ==========================================================================
-   Design tokens
+   Design tokens — modern, minimal, dark-first
    ========================================================================== */
 
 :root {
     color-scheme: dark;
 
-    --bg: #07080b;
-    --bg-glow-1: rgba(88, 128, 255, 0.10);
-    --bg-glow-2: rgba(160, 110, 255, 0.08);
+    --bg: #0a0b0f;
+    --bg-glow-1: rgba(96, 145, 255, 0.07);
+    --bg-glow-2: rgba(150, 110, 255, 0.05);
 
-    --surface: #12141b;
-    --surface-2: #1a1d27;
-    --surface-2-hover: #222634;
-    --glass: rgba(10, 12, 17, 0.72);
+    --surface: #13151b;
+    --surface-2: #1a1d25;
+    --surface-2-hover: #222633;
+    --surface-3: #262a36;
+    --glass: rgba(11, 13, 18, 0.82);
 
-    --border: rgba(255, 255, 255, 0.08);
-    --border-strong: rgba(255, 255, 255, 0.18);
+    --border: rgba(255, 255, 255, 0.075);
+    --border-strong: rgba(255, 255, 255, 0.17);
 
-    --text: #eceff5;
-    --text-dim: #98a1b2;
-    --text-mute: #69717f;
+    --text: #eef0f5;
+    --text-dim: #9ba3b2;
+    --text-mute: #6b7280;
 
-    --accent: #6aa2ff;
-    --accent-hover: #8bb8ff;
-    --accent-soft: rgba(106, 162, 255, 0.14);
+    --accent: #6a9dff;
+    --accent-hover: #8ab4ff;
+    --accent-soft: rgba(106, 157, 255, 0.13);
     --accent-2: #a78bfa;
     --on-accent: #05070c;
 
     --ok: #3ddc97;
-    --ok-soft: rgba(61, 220, 151, 0.12);
+    --ok-soft: rgba(61, 220, 151, 0.11);
     --warn: #fbbf24;
-    --warn-soft: rgba(251, 191, 36, 0.12);
+    --warn-soft: rgba(251, 191, 36, 0.11);
     --danger: #fb7185;
-    --danger-soft: rgba(251, 113, 133, 0.12);
+    --danger-soft: rgba(251, 113, 133, 0.11);
 
-    --sk-shine: rgba(255, 255, 255, 0.07);
-    --hover-tint: rgba(255, 255, 255, 0.06);
+    --sk-shine: rgba(255, 255, 255, 0.055);
+    --hover-tint: rgba(255, 255, 255, 0.055);
 
-    --radius-lg: 20px;
-    --radius: 14px;
-    --radius-sm: 10px;
+    --radius-lg: 18px;
+    --radius: 13px;
+    --radius-sm: 9px;
 
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
-    --shadow: 0 28px 56px -28px rgba(0, 0, 0, 0.9), 0 2px 8px rgba(0, 0, 0, 0.45);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+    --shadow: 0 24px 48px -28px rgba(0, 0, 0, 0.85), 0 2px 8px rgba(0, 0, 0, 0.35);
 
     --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
     --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-    --spring: cubic-bezier(0.34, 1.32, 0.5, 1);
+    --spring: cubic-bezier(0.34, 1.28, 0.5, 1);
 
-    --dur-1: 0.16s;
-    --dur-2: 0.28s;
-    --dur-3: 0.5s;
+    --dur-1: 0.15s;
+    --dur-2: 0.25s;
+    --dur-3: 0.42s;
 
-    --bar-h: 58px;
+    --bar-h: 56px;
 }
 
 [data-theme='light'] {
     color-scheme: light;
 
-    --bg: #f5f6f9;
-    --bg-glow-1: rgba(88, 128, 255, 0.16);
-    --bg-glow-2: rgba(160, 110, 255, 0.12);
+    --bg: #f6f7f9;
+    --bg-glow-1: rgba(96, 145, 255, 0.10);
+    --bg-glow-2: rgba(150, 110, 255, 0.07);
 
     --surface: #ffffff;
-    --surface-2: #eef0f5;
-    --surface-2-hover: #e4e7ee;
-    --glass: rgba(255, 255, 255, 0.78);
+    --surface-2: #eff1f5;
+    --surface-2-hover: #e6e9ef;
+    --surface-3: #dde1e8;
+    --glass: rgba(255, 255, 255, 0.86);
 
-    --border: rgba(15, 23, 42, 0.09);
+    --border: rgba(15, 23, 42, 0.085);
     --border-strong: rgba(15, 23, 42, 0.2);
 
-    --text: #0f172a;
-    --text-dim: #5a6474;
-    --text-mute: #8b93a3;
+    --text: #101623;
+    --text-dim: #596273;
+    --text-mute: #8991a1;
 
     --accent: #2f6fed;
-    --accent-hover: #1f5bd8;
-    --accent-soft: rgba(47, 111, 237, 0.1);
+    --accent-hover: #205ed8;
+    --accent-soft: rgba(47, 111, 237, 0.09);
     --accent-2: #7c5cff;
     --on-accent: #ffffff;
 
-    --ok: #12a171;
-    --ok-soft: rgba(18, 161, 113, 0.1);
-    --warn: #c2820a;
-    --warn-soft: rgba(194, 130, 10, 0.12);
-    --danger: #dc2f4a;
-    --danger-soft: rgba(220, 47, 74, 0.1);
+    --ok: #0f9f70;
+    --ok-soft: rgba(15, 159, 112, 0.09);
+    --warn: #b9790a;
+    --warn-soft: rgba(185, 121, 10, 0.10);
+    --danger: #d92d4a;
+    --danger-soft: rgba(217, 45, 74, 0.09);
 
-    --sk-shine: rgba(15, 23, 42, 0.05);
+    --sk-shine: rgba(15, 23, 42, 0.045);
     --hover-tint: rgba(15, 23, 42, 0.04);
 
-    --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
-    --shadow: 0 28px 56px -30px rgba(15, 23, 42, 0.3), 0 2px 8px rgba(15, 23, 42, 0.06);
+    --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.07);
+    --shadow: 0 24px 48px -30px rgba(15, 23, 42, 0.28), 0 2px 8px rgba(15, 23, 42, 0.05);
 }
 
 /* --------------------------------------------------------------------------
-   Accent palettes
-   `blue` is the default defined above; these override only the accent tokens.
-   Every palette has a dark AND a light variant, so changing the accent never
-   disturbs the light/dark mode — and vice versa.
+   Accent palettes (`blue` is the default above)
    -------------------------------------------------------------------------- */
 
 [data-accent='teal'] {
     --accent: #2dd4bf;
     --accent-hover: #5eead4;
-    --accent-soft: rgba(45, 212, 191, 0.14);
+    --accent-soft: rgba(45, 212, 191, 0.13);
     --accent-2: #38bdf8;
     --on-accent: #04201c;
 }
@@ -112,7 +111,7 @@
 [data-accent='violet'] {
     --accent: #a78bfa;
     --accent-hover: #c4b5fd;
-    --accent-soft: rgba(167, 139, 250, 0.16);
+    --accent-soft: rgba(167, 139, 250, 0.15);
     --accent-2: #f472b6;
     --on-accent: #14071f;
 }
@@ -120,7 +119,7 @@
 [data-accent='amber'] {
     --accent: #fbbf24;
     --accent-hover: #fcd34d;
-    --accent-soft: rgba(251, 191, 36, 0.15);
+    --accent-soft: rgba(251, 191, 36, 0.14);
     --accent-2: #fb923c;
     --on-accent: #21160a;
 }
@@ -128,7 +127,7 @@
 [data-accent='rose'] {
     --accent: #fb7185;
     --accent-hover: #fda4af;
-    --accent-soft: rgba(251, 113, 133, 0.15);
+    --accent-soft: rgba(251, 113, 133, 0.14);
     --accent-2: #c084fc;
     --on-accent: #2a0a12;
 }
@@ -136,7 +135,7 @@
 [data-accent='green'] {
     --accent: #3ddc97;
     --accent-hover: #6ee7b7;
-    --accent-soft: rgba(61, 220, 151, 0.14);
+    --accent-soft: rgba(61, 220, 151, 0.13);
     --accent-2: #22d3ee;
     --on-accent: #052018;
 }
@@ -144,7 +143,7 @@
 [data-theme='light'][data-accent='teal'] {
     --accent: #0d9488;
     --accent-hover: #0f766e;
-    --accent-soft: rgba(13, 148, 136, 0.1);
+    --accent-soft: rgba(13, 148, 136, 0.09);
     --accent-2: #0891b2;
     --on-accent: #ffffff;
 }
@@ -152,7 +151,7 @@
 [data-theme='light'][data-accent='violet'] {
     --accent: #7c3aed;
     --accent-hover: #6d28d9;
-    --accent-soft: rgba(124, 58, 237, 0.1);
+    --accent-soft: rgba(124, 58, 237, 0.09);
     --accent-2: #db2777;
     --on-accent: #ffffff;
 }
@@ -160,7 +159,7 @@
 [data-theme='light'][data-accent='amber'] {
     --accent: #b45309;
     --accent-hover: #92400e;
-    --accent-soft: rgba(180, 83, 9, 0.1);
+    --accent-soft: rgba(180, 83, 9, 0.09);
     --accent-2: #ea580c;
     --on-accent: #ffffff;
 }
@@ -168,7 +167,7 @@
 [data-theme='light'][data-accent='rose'] {
     --accent: #e11d48;
     --accent-hover: #be123c;
-    --accent-soft: rgba(225, 29, 72, 0.1);
+    --accent-soft: rgba(225, 29, 72, 0.09);
     --accent-2: #9333ea;
     --on-accent: #ffffff;
 }
@@ -176,7 +175,7 @@
 [data-theme='light'][data-accent='green'] {
     --accent: #059669;
     --accent-hover: #047857;
-    --accent-soft: rgba(5, 150, 105, 0.1);
+    --accent-soft: rgba(5, 150, 105, 0.09);
     --accent-2: #0891b2;
     --on-accent: #ffffff;
 }
@@ -214,10 +213,13 @@ body {
     line-height: 1.6;
     color: var(--text);
     background-color: var(--bg);
-    background-image: radial-gradient(1200px 700px at 12% -12%, var(--bg-glow-1), transparent 70%),
-        radial-gradient(900px 600px at 105% 8%, var(--bg-glow-2), transparent 70%);
-    background-attachment: fixed;
+    /* 渐变不随滚动固定：固定背景在移动端滚动时会持续重绘，明显掉帧 */
+    background-image: radial-gradient(900px 520px at 10% -12%, var(--bg-glow-1), transparent 62%),
+        radial-gradient(720px 460px at 104% 4%, var(--bg-glow-2), transparent 66%);
     background-repeat: no-repeat;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
     transition: background-color var(--dur-3) var(--ease), color var(--dur-3) var(--ease);
 }
 
@@ -273,15 +275,15 @@ input {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 0.45rem;
-    height: 38px;
-    padding: 0 0.95rem;
+    gap: 0.42rem;
+    height: 36px;
+    padding: 0 0.9rem;
     border: 1px solid var(--border);
-    border-radius: 11px;
+    border-radius: 10px;
     background-color: var(--surface-2);
     color: var(--text);
-    font-size: 0.9rem;
-    font-weight: 520;
+    font-size: 0.88rem;
+    font-weight: 540;
     white-space: nowrap;
     cursor: pointer;
     transition: background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease),
@@ -298,15 +300,21 @@ input {
 }
 
 .btn:disabled {
-    opacity: 0.45;
+    opacity: 0.42;
     cursor: not-allowed;
+}
+
+.btn-sm {
+    height: 30px;
+    padding: 0 0.7rem;
+    font-size: 0.82rem;
 }
 
 .btn-accent {
     background-color: var(--accent);
     border-color: transparent;
     color: var(--on-accent);
-    font-weight: 640;
+    font-weight: 620;
 }
 
 .btn-accent:hover:not(:disabled) {
@@ -323,13 +331,13 @@ input {
 
 .btn-danger {
     color: var(--danger);
-    border-color: rgba(251, 113, 133, 0.3);
+    border-color: rgba(251, 113, 133, 0.28);
     background-color: var(--danger-soft);
 }
 
 .btn-danger:hover:not(:disabled) {
-    background-color: rgba(251, 113, 133, 0.2);
-    border-color: rgba(251, 113, 133, 0.5);
+    background-color: rgba(251, 113, 133, 0.18);
+    border-color: rgba(251, 113, 133, 0.46);
 }
 
 .btn-block {
@@ -337,9 +345,13 @@ input {
 }
 
 .btn svg {
-    width: 16px;
-    height: 16px;
+    width: 15px;
+    height: 15px;
     fill: currentColor;
+}
+
+.btn.is-busy svg {
+    animation: spin 0.8s linear infinite;
 }
 
 /* ==========================================================================
@@ -353,10 +365,10 @@ input[type='password'] {
     height: 38px;
     padding: 0 0.75rem;
     border: 1px solid var(--border);
-    border-radius: 11px;
+    border-radius: 10px;
     background-color: var(--surface);
     color: var(--text);
-    font-size: 0.95rem;
+    font-size: 0.94rem;
     transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
 }
 
@@ -376,9 +388,10 @@ input[type='password']:focus {
 .seg {
     position: relative;
     display: inline-flex;
+    flex: 0 0 auto;
     padding: 3px;
     border: 1px solid var(--border);
-    border-radius: 13px;
+    border-radius: 12px;
     background-color: var(--surface);
 }
 
@@ -387,7 +400,7 @@ input[type='password']:focus {
     top: 3px;
     left: 3px;
     height: calc(100% - 6px);
-    border-radius: 10px;
+    border-radius: 9px;
     background-color: var(--surface-2);
     border: 1px solid var(--border);
     transition: transform var(--dur-3) var(--spring), width var(--dur-3) var(--spring);
@@ -397,14 +410,14 @@ input[type='password']:focus {
 .seg-btn {
     position: relative;
     z-index: 1;
-    height: 32px;
-    padding: 0 0.95rem;
+    height: 30px;
+    padding: 0 0.9rem;
     border: none;
-    border-radius: 10px;
+    border-radius: 9px;
     background: transparent;
     color: var(--text-dim);
-    font-size: 0.9rem;
-    font-weight: 560;
+    font-size: 0.88rem;
+    font-weight: 540;
     cursor: pointer;
     transition: color var(--dur-2) var(--ease);
 }
@@ -425,12 +438,12 @@ input[type='password']:focus {
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
-    height: 26px;
-    padding: 0 0.65rem;
+    height: 25px;
+    padding: 0 0.62rem;
     border: 1px solid var(--border);
     border-radius: 999px;
-    font-size: 0.78rem;
-    font-weight: 620;
+    font-size: 0.76rem;
+    font-weight: 600;
     color: var(--text-dim);
     background-color: var(--surface-2);
     transition: color var(--dur-2) var(--ease), background-color var(--dur-2) var(--ease),
@@ -448,19 +461,19 @@ input[type='password']:focus {
 .pill-ok {
     color: var(--ok);
     background-color: var(--ok-soft);
-    border-color: rgba(61, 220, 151, 0.28);
+    border-color: rgba(61, 220, 151, 0.26);
 }
 
 .pill-warn {
     color: var(--warn);
     background-color: var(--warn-soft);
-    border-color: rgba(251, 191, 36, 0.28);
+    border-color: rgba(251, 191, 36, 0.26);
 }
 
 .pill-danger {
     color: var(--danger);
     background-color: var(--danger-soft);
-    border-color: rgba(251, 113, 133, 0.28);
+    border-color: rgba(251, 113, 133, 0.26);
 }
 
 .pill-mute {
@@ -478,7 +491,7 @@ input[type='password']:focus {
         transform: scale(1);
     }
     50% {
-        opacity: 0.45;
+        opacity: 0.4;
         transform: scale(0.7);
     }
 }
@@ -506,7 +519,7 @@ input[type='password']:focus {
     inset: 0;
     transform: translateX(-100%);
     background-image: linear-gradient(90deg, transparent, var(--sk-shine), transparent);
-    animation: shimmer 1.5s infinite;
+    animation: shimmer 1.4s infinite;
 }
 
 @keyframes shimmer {
@@ -540,18 +553,18 @@ input[type='password']:focus {
 
 .stat-value {
     font-variant-numeric: tabular-nums;
-    font-weight: 680;
+    font-weight: 660;
     letter-spacing: -0.02em;
 }
 
 .icon-button {
     display: grid;
     place-items: center;
-    width: 38px;
-    height: 38px;
+    width: 36px;
+    height: 36px;
     padding: 0;
     border: 1px solid var(--border);
-    border-radius: 11px;
+    border-radius: 10px;
     background-color: transparent;
     color: var(--text-dim);
     cursor: pointer;
@@ -570,8 +583,8 @@ input[type='password']:focus {
 }
 
 .icon-button svg {
-    width: 17px;
-    height: 17px;
+    width: 16px;
+    height: 16px;
     fill: currentColor;
 }
 
@@ -585,6 +598,12 @@ input[type='password']:focus {
 
 [data-theme='light'] .theme-toggle .icon-moon {
     display: block;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
 }
 
 @media (prefers-reduced-motion: reduce) {

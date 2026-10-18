@@ -1,5 +1,5 @@
 import { el, create } from './dom.js';
-import { restartAnimation } from './anim.js';
+import { prefersReducedMotion, restartAnimation } from './anim.js';
 import { epochOf, formatDuration, formatFileSize, preloadAround, timeLabel, timeShort } from './util.js';
 
 /* 1x = 实时（1 真实秒 = 1 播放秒）；每帧停留时长按真实抓拍间隔 / 倍速 计算 */
@@ -32,6 +32,8 @@ const state = {
     playing: false,
     speedIndex: 0,
     timer: null,
+    closeTimer: null,
+    timelineFrame: null,
 };
 
 export function isViewerOpen() {
@@ -44,6 +46,14 @@ export function isViewerLive() {
 
 export function openViewer(options) {
     const settings = options || {};
+
+    /* 上一次关闭的退场动画还没结束就重新打开：取消它，保证内容立即可见 */
+    if (state.closeTimer !== null) {
+        window.clearTimeout(state.closeTimer);
+        state.closeTimer = null;
+    }
+    el.viewer.classList.remove('is-closing');
+
     state.items = Array.isArray(settings.items) ? settings.items.slice() : [];
     if (!state.items.length) {
         return;
@@ -85,14 +95,28 @@ export function closeViewer() {
     }
     stopTimer();
     closeSpeedMenu();
+    if (state.timelineFrame !== null) {
+        window.cancelAnimationFrame(state.timelineFrame);
+        state.timelineFrame = null;
+    }
     state.playing = false;
     state.open = false;
 
-    el.viewer.hidden = true;
-    el.viewer.classList.remove('is-maximized', 'is-open');
-    el.viewerImage.classList.remove('is-swapping');
-    document.body.classList.remove('no-scroll');
-    el.viewerImage.removeAttribute('src');
+    const finish = () => {
+        state.closeTimer = null;
+        el.viewer.hidden = true;
+        el.viewer.classList.remove('is-maximized', 'is-open', 'is-closing');
+        el.viewerImage.classList.remove('is-swapping');
+        document.body.classList.remove('no-scroll');
+        el.viewerImage.removeAttribute('src');
+    };
+
+    if (prefersReducedMotion()) {
+        finish();
+    } else {
+        el.viewer.classList.add('is-closing');
+        state.closeTimer = window.setTimeout(finish, 170);
+    }
 
     const callback = state.onClose;
     state.onClose = null;
@@ -426,6 +450,11 @@ function render(animate) {
         return;
     }
 
+    if (state.timelineFrame !== null) {
+        window.cancelAnimationFrame(state.timelineFrame);
+        state.timelineFrame = null;
+    }
+
     if (animate) {
         swapImage(item.image_url);
     } else {
@@ -464,6 +493,11 @@ function render(animate) {
 /* ---------------------------------------------------------------- 初始化 */
 
 export function initViewer() {
+    el.viewerImage.decoding = 'async';
+    el.viewerImage.addEventListener('error', () => {
+        el.viewerImage.classList.remove('is-swapping');
+    });
+
     el.viewerClose.addEventListener('click', closeViewer);
     el.viewerPrev.addEventListener('click', () => navigate(-1));
     el.viewerNext.addEventListener('click', () => navigate(1));
@@ -500,7 +534,6 @@ export function initViewer() {
         state.index = Math.min(Math.max(0, index), state.items.length - 1);
         const item = state.items[state.index];
         if (item) {
-            el.viewerImage.src = item.image_url;
             el.viewerImage.alt = item.filename || '';
             el.viewerFilename.textContent = item.filename || '—';
             el.viewerFilesize.textContent = formatFileSize(item.filesize);
@@ -512,6 +545,19 @@ export function initViewer() {
             el.viewerNext.disabled = state.index === state.items.length - 1;
             renderInterval(item);
             renderTimeline(item);
+
+            /* 拖动时间轴会在 input 中高频触发；图片切换合并到下一帧，
+               避免一次拖动发出几十个图片请求。 */
+            if (state.timelineFrame !== null) {
+                window.cancelAnimationFrame(state.timelineFrame);
+            }
+            state.timelineFrame = window.requestAnimationFrame(() => {
+                state.timelineFrame = null;
+                const current = state.items[state.index];
+                if (current) {
+                    el.viewerImage.src = current.image_url;
+                }
+            });
         }
     });
 

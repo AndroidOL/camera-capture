@@ -1,6 +1,6 @@
 import { apiGet } from './api.js';
 import { create, el, setStatus } from './dom.js';
-import { animateScaleY, restartAnimation, stagger } from './anim.js';
+import { animateScaleY, prefersReducedMotion, restartAnimation, stagger } from './anim.js';
 import { setValue as setDateValue } from './datepicker.js';
 import { openViewer } from './viewer.js';
 import {
@@ -21,6 +21,9 @@ let crumbSignature = null;
 let statsContent = false;
 let activityContent = false;
 let levelBarAllowed = true;
+let renderToken = 0;
+let monitorCrumbMode = false;
+let monitorCrumbTime = null;
 
 export function getState() {
     return {
@@ -32,6 +35,14 @@ export function getState() {
     };
 }
 
+export function getHistory() {
+    return history.slice();
+}
+
+export function showGallerySkeletons(count, isPhotos) {
+    renderSkeletons(count === undefined ? 6 : count, !!isPhotos);
+}
+
 export function resetToDate(date) {
     history = [];
     state.level = date ? 1 : 0;
@@ -40,6 +51,7 @@ export function resetToDate(date) {
     state.slot = '';
     state.minute = '';
     render();
+    emitState();
 }
 
 export function goBack() {
@@ -53,12 +65,86 @@ export function goBack() {
     state.slot = previous.slot;
     state.minute = previous.minute;
     render();
+    emitState();
+}
+
+/**
+ * 从 History API 的 state 恢复导航位置（浏览器前进/后退）。
+ * 不写入历史、不重复 emitState。
+ */
+export function restoreGalleryState(payload) {
+    const data = payload && payload.state ? payload.state : payload;
+    if (!data) {
+        return;
+    }
+
+    const level = Math.max(0, Math.min(4, Number(data.level) || 0));
+    state.level = level;
+    state.date = typeof data.date === 'string' ? data.date : '';
+    state.hour = level >= 2 && typeof data.hour === 'string' ? data.hour : '';
+    state.slot = level >= 3 && data.slot !== '' && data.slot !== null && data.slot !== undefined
+        ? String(data.slot)
+        : '';
+    state.minute = level >= 4 && typeof data.minute === 'string' ? data.minute : '';
+    history = payload && Array.isArray(payload.history) ? payload.history.slice() : [];
+    render();
+}
+
+/**
+ * 登出时清空相册状态与 DOM，避免旧会话的照片信息残留在页面上。
+ * 不触发 History 写入。
+ */
+export function resetGalleryState() {
+    renderToken++;
+    history = [];
+    state.level = 0;
+    state.date = '';
+    state.hour = '';
+    state.slot = '';
+    state.minute = '';
+    monitorCrumbMode = false;
+    monitorCrumbTime = null;
+    crumbSignature = null;
+    statsContent = false;
+    activityContent = false;
+
+    if (el.gallery) {
+        el.gallery.textContent = '';
+        el.gallery.className = 'grid';
+    }
+    if (el.levelStats) {
+        el.levelStats.textContent = '';
+    }
+    if (el.activityBar) {
+        el.activityBar.textContent = '';
+    }
+    if (el.monitor) {
+        el.monitor.hidden = true;
+    }
+    if (el.monitorImage) {
+        el.monitorImage.removeAttribute('src');
+    }
+    if (el.monitorFilename) {
+        el.monitorFilename.textContent = '—';
+    }
+    if (el.monitorFilesize) {
+        el.monitorFilesize.textContent = '—';
+    }
+    if (el.monitorTime) {
+        el.monitorTime.textContent = '—';
+    }
+    applyLevelBar();
+    setStatus('');
+    setDateValue('');
+    updateChrome();
 }
 
 export function updateChrome() {
     if (el.backButton) {
         el.backButton.hidden = history.length === 0;
     }
+    monitorCrumbMode = false;
+    monitorCrumbTime = null;
     crumbSignature = null;
     renderBreadcrumb();
 }
@@ -73,21 +159,30 @@ export function setMonitorCrumb(photo) {
     if (!nav) {
         return;
     }
-    const signature = 'monitor:' + (photo && photo.filename ? photo.filename : '');
-    if (signature === crumbSignature) {
+
+    /* 监控每秒都可能刷新照片；只在结构变化时重建 DOM，
+       后续仅更新时间文本，避免每秒一次的 DOM 重建与动画重放。 */
+    if (!monitorCrumbMode) {
+        monitorCrumbMode = true;
+        monitorCrumbTime = null;
+        crumbSignature = 'monitor';
+
+        nav.textContent = '';
+        const fragment = document.createDocumentFragment();
+        fragment.appendChild(create('span', 'crumb-current crumb-live', '实时监控'));
+        if (photo) {
+            fragment.appendChild(create('span', 'crumb-sep', '›'));
+            monitorCrumbTime = create('span', 'crumb-current', timeLabel(photo));
+            fragment.appendChild(monitorCrumbTime);
+        }
+        nav.appendChild(fragment);
+        restartAnimation(nav);
         return;
     }
-    crumbSignature = signature;
 
-    nav.textContent = '';
-    const fragment = document.createDocumentFragment();
-    fragment.appendChild(create('span', 'crumb-current crumb-live', '实时监控'));
-    if (photo) {
-        fragment.appendChild(create('span', 'crumb-sep', '›'));
-        fragment.appendChild(create('span', 'crumb-current', timeLabel(photo)));
+    if (photo && monitorCrumbTime) {
+        monitorCrumbTime.textContent = timeLabel(photo);
     }
-    nav.appendChild(fragment);
-    restartAnimation(nav);
 }
 
 export function initGallery() {
@@ -122,15 +217,37 @@ function navigate(targetLevel, patch) {
     history.push(snapshot());
     applyState(targetLevel, patch);
     render();
+    emitState();
+    scrollToTop();
 }
 
 function jumpTo(targetLevel, patch) {
     history = [];
     applyState(targetLevel, patch);
     render();
+    emitState();
+    scrollToTop();
+}
+
+function emitState() {
+    document.dispatchEvent(
+        new CustomEvent('gallery:state', {
+            detail: { state: getState(), history: getHistory() },
+        })
+    );
+}
+
+function scrollToTop() {
+    if (window.scrollY > 0) {
+        window.scrollTo({ top: 0, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+    }
 }
 
 function render() {
+    /* 每次渲染发一张新"票"：异步响应回来时票已过期就直接丢弃，
+       防止快速切换层级时旧请求覆盖新内容（页面看起来"错位"）。 */
+    const token = ++renderToken;
+
     setStatus('');
     setDateValue(state.date);
     crumbSignature = null;
@@ -146,13 +263,13 @@ function render() {
         return;
     }
     if (state.level === 1) {
-        loadDaily();
+        loadDaily(token);
     } else if (state.level === 2) {
-        loadHourly();
+        loadHourly(token);
     } else if (state.level === 3) {
-        loadTenMinute();
+        loadTenMinute(token);
     } else if (state.level === 4) {
-        loadMinute();
+        loadMinute(token);
     }
 }
 
@@ -389,25 +506,34 @@ function renderTiles(items, isPhotos, describe, onSelect) {
     restartAnimation(el.gallery);
 }
 
-function showError(message) {
+function showError(message, retry) {
     el.gallery.textContent = '';
     el.gallery.className = 'grid';
     clearLevelBar();
     setStatus(message, true);
+
+    if (retry && el.status) {
+        const action = create('button', 'status-action', '重试');
+        action.type = 'button';
+        action.addEventListener('click', retry);
+        el.status.appendChild(action);
+    }
 }
 
-async function loadDaily() {
+async function loadDaily(token) {
     const date = state.date;
     renderSkeletons(6, false);
 
     let data;
     try {
-        data = await apiGet('getDailySummary', { date });
+        data = await apiGet('getDailySummary', { date }, { timeout: 12000 });
     } catch (error) {
-        showError(error.message);
+        if (token === renderToken) {
+            showError(error.message, () => render());
+        }
         return;
     }
-    if (!data) {
+    if (!data || token !== renderToken) {
         return;
     }
 
@@ -422,19 +548,21 @@ async function loadDaily() {
     renderActivity(items);
 }
 
-async function loadHourly() {
+async function loadHourly(token) {
     const date = state.date;
     const hour = state.hour;
     renderSkeletons(6, false);
 
     let data;
     try {
-        data = await apiGet('getHourlySummary', { date, hour });
+        data = await apiGet('getHourlySummary', { date, hour }, { timeout: 12000 });
     } catch (error) {
-        showError(error.message);
+        if (token === renderToken) {
+            showError(error.message, () => render());
+        }
         return;
     }
-    if (!data) {
+    if (!data || token !== renderToken) {
         return;
     }
 
@@ -448,7 +576,7 @@ async function loadHourly() {
     renderStats(items, undefined, items.length + ' 个时段');
 }
 
-async function loadTenMinute() {
+async function loadTenMinute(token) {
     const date = state.date;
     const hour = state.hour;
     const slot = state.slot;
@@ -456,12 +584,18 @@ async function loadTenMinute() {
 
     let data;
     try {
-        data = await apiGet('getTenMinuteSummary', { date, hour, interval_slot: slot });
+        data = await apiGet(
+            'getTenMinuteSummary',
+            { date, hour, interval_slot: slot },
+            { timeout: 12000 }
+        );
     } catch (error) {
-        showError(error.message);
+        if (token === renderToken) {
+            showError(error.message, () => render());
+        }
         return;
     }
-    if (!data) {
+    if (!data || token !== renderToken) {
         return;
     }
 
@@ -475,20 +609,22 @@ async function loadTenMinute() {
     renderStats(items, undefined, items.length + ' 个分钟');
 }
 
-async function loadMinute() {
+async function loadMinute(token) {
     const date = state.date;
     const hour = state.hour;
     const minute = state.minute;
-    renderSkeletons(4, true);
+    renderSkeletons(6, true);
 
     let data;
     try {
-        data = await apiGet('getMinutePhotos', { date, hour, minute });
+        data = await apiGet('getMinutePhotos', { date, hour, minute }, { timeout: 12000 });
     } catch (error) {
-        showError(error.message);
+        if (token === renderToken) {
+            showError(error.message, () => render());
+        }
         return;
     }
-    if (!data) {
+    if (!data || token !== renderToken) {
         return;
     }
 

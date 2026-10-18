@@ -3,6 +3,18 @@ function byId(id) {
 }
 
 export const el = {
+    appRoot: byId('appRoot'),
+    authOverlay: byId('authOverlay'),
+    authForm: byId('authForm'),
+    authPassword: byId('authPassword'),
+    authToggle: byId('authToggle'),
+    authCaps: byId('authCaps'),
+    authError: byId('authError'),
+    authSubmit: byId('authSubmit'),
+    authSub: byId('authSub'),
+    logoutForm: byId('logoutForm'),
+    logoutButton: byId('logoutButton'),
+
     viewNav: byId('viewNav'),
     segThumb: byId('segThumb'),
     viewGallery: byId('view-gallery'),

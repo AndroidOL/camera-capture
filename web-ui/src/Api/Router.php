@@ -8,6 +8,7 @@ final class Router
     private const ACTIONS = [
         'getEarliestDate',
         'getLatestDate',
+        'getDateBounds',
         'getAvailableDates',
         'getLatestPhoto',
         'getDailySummary',

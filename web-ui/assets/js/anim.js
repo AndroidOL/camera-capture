@@ -74,6 +74,24 @@ export function animateScaleY(element, fraction) {
     });
 }
 
+/**
+ * 重新播放一批 `.reveal` 的入场动画。
+ * 用于「运维」标签每次切回来时的轻量错峰入场；元素本身默认可见，
+ * 因此即使 IntersectionObserver 不可用也不会出现空白面板。
+ */
+export function replayReveal(root) {
+    const nodes = (root || document).querySelectorAll('.reveal');
+    if (!nodes.length || prefersReducedMotion()) {
+        return;
+    }
+    for (let i = 0; i < nodes.length; i++) {
+        nodes[i].style.setProperty('--i', String(i));
+        nodes[i].classList.remove('in');
+        void nodes[i].offsetWidth;
+        nodes[i].classList.add('in');
+    }
+}
+
 export function observeReveal(root) {
     const scope = root || document;
     const nodes = scope.querySelectorAll('.reveal');

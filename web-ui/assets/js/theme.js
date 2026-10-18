@@ -73,7 +73,7 @@ export function applyTheme(mode) {
     /* 同步浏览器 UI（地址栏/状态栏）与"首帧配色"，避免刷新闪一下 */
     const themeColor = document.querySelector('meta[name="theme-color"]');
     if (themeColor) {
-        themeColor.setAttribute('content', value === 'light' ? '#f5f6f9' : '#07080b');
+        themeColor.setAttribute('content', value === 'light' ? '#f6f7f9' : '#0a0b0f');
     }
     const scheme = document.querySelector('meta[name="color-scheme"]');
     if (scheme) {

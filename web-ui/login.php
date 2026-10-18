@@ -5,18 +5,57 @@ use Gallery\Security\Csrf;
 use Gallery\Security\Headers;
 use Gallery\Support\Asset;
 use Gallery\Support\RateLimiter;
+use Gallery\Support\Response;
 use Gallery\Support\Theme;
 
 require __DIR__ . '/src/bootstrap.php';
 
 Headers::apply('page');
 
+$accept = isset($_SERVER['HTTP_ACCEPT']) ? (string) $_SERVER['HTTP_ACCEPT'] : '';
+$requestedWith = isset($_SERVER['HTTP_X_REQUESTED_WITH']) ? strtolower((string) $_SERVER['HTTP_X_REQUESTED_WITH']) : '';
+$isAjax = strpos($accept, 'application/json') !== false || $requestedWith === 'xmlhttprequest';
+
 if (Auth::isAuthenticated()) {
+    if ($isAjax) {
+        Response::json(['ok' => true, 'csrf_token' => Csrf::token()]);
+        exit;
+    }
     header('Location: index.php');
     exit;
 }
 
+/* 会话超时会被 Auth::isAuthenticated() 销毁，重新建立后才能生成有效 CSRF token。 */
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    Auth::startSession();
+}
+
+/* AJAX 获取新的 CSRF token（会话超时后在当前页面内恢复登录浮层，无需刷新）。
+   该接口会创建/复用会话，因此单独限速，避免被用来刷会话文件。 */
+if ($isAjax && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    $tokenThrottle = RateLimiter::check(
+        'auth-token:' . Auth::clientIp(),
+        Config::getInt('auth_token_rate_limit', 30),
+        60
+    );
+
+    if (!$tokenThrottle['allowed']) {
+        if (!headers_sent()) {
+            header('Retry-After: ' . $tokenThrottle['retry_after']);
+        }
+        Response::json(
+            ['error' => '请求过于频繁，请稍后再试。', 'retry_after' => $tokenThrottle['retry_after']],
+            429
+        );
+        exit;
+    }
+
+    Response::json(['ok' => true, 'authenticated' => false, 'csrf_token' => Csrf::token()]);
+    exit;
+}
+
 $error = '';
+$errorStatus = 400;
 
 if (isset($_GET['error'])) {
     if ($_GET['error'] === 'unauthorized') {
@@ -35,23 +74,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     );
 
     if (!$throttle['allowed']) {
-        $minutes = max(1, (int) ceil($throttle['retry_after'] / 60));
-        $error = '尝试次数过多，请约 ' . $minutes . ' 分钟后再试。';
+        $retryAfter = max(1, (int) $throttle['retry_after']);
+        $error = $retryAfter < 60
+            ? '尝试次数过多，请 ' . $retryAfter . ' 秒后再试。'
+            : '尝试次数过多，请约 ' . max(1, (int) ceil($retryAfter / 60)) . ' 分钟后再试。';
+        $errorStatus = 429;
+        if (!headers_sent()) {
+            header('Retry-After: ' . $throttle['retry_after']);
+        }
     } elseif (!Csrf::validate(isset($_POST['csrf_token']) ? $_POST['csrf_token'] : null)) {
         $error = '会话已失效，请刷新页面后重试。';
+        $errorStatus = 403;
     } elseif (!Config::hasPassword()) {
         $error = '尚未配置访问密码，请先编辑 config.php 或设置 GALLERY_PASSWORD_HASH。';
+        $errorStatus = 400;
     } else {
         $password = isset($_POST['password']) ? (string) $_POST['password'] : '';
         if (Auth::attempt($password)) {
             RateLimiter::reset('login:' . $ip);
+            if ($isAjax) {
+                Response::json(['ok' => true, 'csrf_token' => Csrf::token()]);
+                exit;
+            }
             header('Location: index.php');
             exit;
         }
         $error = '密码错误，请重试。';
+        $errorStatus = 401;
         if ($throttle['remaining'] <= 2) {
             $error .= ' 剩余尝试次数：' . $throttle['remaining'] . '。';
         }
+    }
+
+    if ($isAjax) {
+        $payload = ['error' => $error];
+        if ($errorStatus === 429) {
+            $payload['retry_after'] = $throttle['retry_after'];
+        } elseif ($errorStatus === 401) {
+            $payload['remaining'] = $throttle['remaining'];
+        }
+        Response::json($payload, $errorStatus);
+        exit;
     }
 }
 $theme = Theme::mode();
@@ -62,11 +125,13 @@ $themeLabel = $theme === 'light' ? '深色' : '浅色';
 <html lang="zh-CN" data-theme="<?= $theme ?>" data-accent="<?= htmlspecialchars($accent, ENT_QUOTES, 'UTF-8') ?>">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="robots" content="noindex, nofollow">
     <meta name="color-scheme" content="<?= $theme === 'light' ? 'light' : 'dark' ?>">
-    <meta name="theme-color" content="<?= $theme === 'light' ? '#f5f6f9' : '#07080b' ?>">
+    <meta name="theme-color" content="<?= $theme === 'light' ? '#f6f7f9' : '#0a0b0f' ?>">
     <title>登录 · 照片查看器</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%236a9dff'/%3E%3Cpath d='M9 6l-1 1.5H6A1.5 1.5 0 0 0 4.5 9v6A1.5 1.5 0 0 0 6 16.5h12a1.5 1.5 0 0 0 1.5-1.5V9A1.5 1.5 0 0 0 18 7.5h-2L15 6H9Zm3 8.5a2.75 2.75 0 1 1 0-5.5 2.75 2.75 0 0 1 0 5.5Z' fill='%2305070c'/%3E%3C/svg%3E">
+    <link rel="modulepreload" href="<?= Asset::url('assets/js/login.js') ?>">
     <link rel="stylesheet" href="<?= Asset::url('assets/css/base.css') ?>">
     <link rel="stylesheet" href="<?= Asset::url('assets/css/login.css') ?>">
 </head>

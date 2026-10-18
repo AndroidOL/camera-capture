@@ -57,10 +57,10 @@ return [
     //   - direct 模式：Web 服务器把这个目录映射成一个 URL 前缀（web_path）
     //
     // 留 null = 默认 <web-ui>/captures。
-    // capture.py 的默认输出目录是 /opt/camera/capture（见项目根 config.yaml），
-    // 部署时通常要显式指过去，例如：
-    //     'captures_dir' => '/opt/camera/capture',
-    // 或 GALLERY_CAPTURES_DIR=/opt/camera/capture
+    // capture.py 的内置默认输出目录是 /opt/camera/captures（与 systemd unit、
+    // merge/ffmpeg-script.sh 一致），部署时通常要显式指过去，例如：
+    //     'captures_dir' => '/opt/camera/captures',
+    // 或 GALLERY_CAPTURES_DIR=/opt/camera/captures
     'captures_dir' => null,
 
     // 图片如何送到浏览器：
@@ -73,7 +73,7 @@ return [
     'image_mode' => 'proxy',
 
     // 仅 'direct' 模式使用：captures_dir 对外暴露的 URL 前缀。
-    // 例：captures_dir = /opt/camera/capture，站点把它映射到 https://host/captures
+    // 例：captures_dir = /opt/camera/captures，站点把它映射到 https://host/captures
     //     → 填 '/captures'
     'web_path' => '/captures',
 
@@ -105,8 +105,15 @@ return [
     'bind_session_to_ip' => false,
 
     // 登录失败限流：window 内超过 attempts 次即锁定 lockout 秒。
+    // 该锁定同时作用于 AJAX 登录；超限返回 429，并带 Retry-After。
     'login_max_attempts' => 5,
     'login_lockout_seconds' => 300,
+
+    // 认证辅助接口限速（每 IP 每分钟）：
+    //   auth_token_rate_limit  —— AJAX 获取新 CSRF token（会话超时恢复）
+    //   auth_logout_rate_limit —— 登出请求
+    'auth_token_rate_limit' => 30,
+    'auth_logout_rate_limit' => 30,
 
     // =========================================================================
     // 5. 接口限流
@@ -167,6 +174,11 @@ return [
     // 每日张数图表的窗口长度（天）与统计缓存 TTL（秒）。
     'stats_recent_days' => 31,
     'stats_cache_ttl' => 3600,
+
+    // 运维面板整块数据的短缓存（秒）。反复切换「运维」标签时直接读缓存，
+    // 避免每次都重新探测磁盘（网络/FUSE 挂载可能很慢）导致页面无响应。
+    // 「刷新」按钮会跳过它；每日统计仍按目录 mtime 复用，刷新也不会全量重扫。
+    'ops_cache_ttl' => 20,
 
     // =========================================================================
     // 9. 安全 / 环境

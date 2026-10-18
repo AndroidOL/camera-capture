@@ -110,13 +110,18 @@ web-ui/
 
 ```
 浏览器
-  ├─ 未登录访问 index.php ──► 302 login.php?error=unauthorized
-  ├─ login.php  (GET 表单带 CSRF) ──► POST ──► 限流检查 ──► 密码校验 ──► session_regenerate_id ──► 302 index.php
+  ├─ 未登录访问 index.php ──► 200 渲染壳层 + #authOverlay（不再 302；页面不含照片数据）
+  ├─ 登录浮层 AJAX ──► POST login.php (Accept: application/json) ──► 限流/CSRF/密码校验
+  │                     └─► session_regenerate_id ──► JSON {ok, csrf_token}
   ├─ index.php  渲染外壳（<script type="module" src="assets/js/app.js">）
-  ├─ app.js     ① 读取 CSRF/主题 ② getEarliestDate + getLatestDate 设日期上下界 ③ 默认定位到最新日期
+  ├─ app.js     ① 读取 CSRF/主题 ② getDateBounds 设日期上下界 ③ 默认定位到最新日期
+  ├─ 登出 AJAX ──► POST logout.php (Accept: application/json) ──► 软登出 + 新 csrf_token ──► 页内登录浮层
   ├─ api.php?action=...  ← 每次翻层调用一次，返回 JSON（含 image_url / preview_image_url）
   └─ image.php?p=...     ← <img> 标签请求，会话鉴权后流式返回照片字节
 ```
+
+> 页面内的视图切换、日期/层级钻取、登录、登出、会话超时恢复都走 AJAX + History API，
+> 不触整页刷新；无 JS 时登录表单仍可原生 POST 回退。详见 §16。
 
 要点：**页面、接口、图片三条路径都独立鉴权**。图片不再由 Web 服务器直接静态提供（见 §8）。
 
@@ -154,6 +159,7 @@ web-ui/
 |---|---|---|
 | `getEarliestDate` | — | `{earliestDate: "YYYY-MM-DD"\|null}` |
 | `getLatestDate` | — | `{latestDate: "YYYY-MM-DD"\|null}` |
+| `getDateBounds` | — | `{earliestDate, latestDate}`（首屏合并请求，少一次往返） |
 | `getAvailableDates` | — | `{availableDates: ["YYYY-MM-DD", …]}`（有 5 分钟缓存） |
 | `getLatestPhoto` | — | `{latest_photo: photo\|null}`（监控轮询用） |
 | `getDailySummary` | `date` | `{date, hourly_previews:[{hour, …photo}]}` |
@@ -232,7 +238,7 @@ image.php?p=<相对路径>&download=1 # 附件下载（Content-Disposition: atta
 | `password_hash_file` | `GALLERY_PASSWORD_HASH_FILE` | `null` | **推荐（容器/密钥）**。指向一个只含一行 `password_hash()` 结果的文件（会 `trim` 换行）。**优先级最高**，且绕过 compose 对 `.env` 的 `$` 插值问题；文件不存在/为空时自动回退到 `password_hash` |
 | `password_hash` | `GALLERY_PASSWORD_HASH` | `''`（留空＝禁止登录） | `password_hash()` 结果；**切勿把真实哈希提交到公开仓库**。三者（`password_hash_file` / `password_hash` / `password`）全空＝禁止登录 |
 | `password` | `GALLERY_PASSWORD` | （空） | **已停用**：明文登录不再被采纳（保留键位只为让运维面板提示迁移），请只用 `password_hash` / `password_hash_file` |
-| `captures_dir` | `GALLERY_CAPTURES_DIR` | `<web-ui>/captures` | 照片库根目录。**proxy 与 direct 两种模式共用的唯一图片来源**（proxy 由 `image.php` 从这里读并鉴权输出；direct 由 Web 服务器把它映射成 `web_path`）。capture.py 的默认输出目录是 `/opt/camera/capture`，部署时通常要显式指过去 |
+| `captures_dir` | `GALLERY_CAPTURES_DIR` | `<web-ui>/captures` | 照片库根目录。**proxy 与 direct 两种模式共用的唯一图片来源**（proxy 由 `image.php` 从这里读并鉴权输出；direct 由 Web 服务器把它映射成 `web_path`）。`capture.py` 的**内置默认**输出目录是 `/opt/camera/captures`（与 systemd unit、`merge/ffmpeg-script.sh` 一致），部署时通常要显式指过去 |
 | `image_mode` | `GALLERY_IMAGE_MODE` | `proxy` | `proxy` / `direct` |
 | `web_path` | `GALLERY_WEB_PATH` | `/captures` | 仅 `direct` 模式使用 |
 | `cache_dir` | `GALLERY_CACHE_DIR` | `<sys_temp>/photo_gallery_cache` | 缓存/限流/缩略图根目录 |
@@ -245,13 +251,16 @@ image.php?p=<相对路径>&download=1 # 附件下载（Content-Disposition: atta
 | `bind_session_to_ip` | `GALLERY_BIND_SESSION_TO_IP` | `false` | 绑定 IP（移动网络下可能误伤，默认关） |
 | `api_rate_limit` | `GALLERY_API_RATE_LIMIT` | `240` | 每 IP 每窗口 API 次数 |
 | `api_rate_window` | `GALLERY_API_RATE_WINDOW` | `60` | API 限流窗口（秒） |
-| `login_max_attempts` | `GALLERY_LOGIN_MAX_ATTEMPTS` | `5` | 登录失败次数上限 |
-| `login_lockout_seconds` | `GALLERY_LOGIN_LOCKOUT_SECONDS` | `300` | 登录锁定时长（秒） |
+| `login_max_attempts` | `GALLERY_LOGIN_MAX_ATTEMPTS` | `5` | 登录失败次数上限（AJAX 登录同样生效） |
+| `login_lockout_seconds` | `GALLERY_LOGIN_LOCKOUT_SECONDS` | `300` | 登录锁定时长（秒）；超限返回 `429` + `Retry-After` |
+| `auth_token_rate_limit` | `GALLERY_AUTH_TOKEN_RATE_LIMIT` | `30` | AJAX 获取新 CSRF token 的每 IP 每分钟上限 |
+| `auth_logout_rate_limit` | `GALLERY_AUTH_LOGOUT_RATE_LIMIT` | `30` | 登出请求的每 IP 每分钟上限 |
 | `health_file` | `GALLERY_HEALTH_FILE` | `/opt/camera/logs/health.json` | 采集服务的健康快照文件（只读） |
 | `health_stale_seconds` | `GALLERY_HEALTH_STALE_SECONDS` | `900` | 心跳超过此秒数即判定为「心跳已过期」 |
 | `disk_warn_percent` | `GALLERY_DISK_WARN_PERCENT` | `85` | 磁盘占用告警阈值（%） |
 | `stats_recent_days` | `GALLERY_STATS_RECENT_DAYS` | `31` | 运维面板图表展示的最近天数（也是 `recent_days` 连续窗口长度） |
 | `stats_cache_ttl` | `GALLERY_STATS_CACHE_TTL` | `3600` | 每日统计缓存 TTL（秒） |
+| `ops_cache_ttl` | `GALLERY_OPS_CACHE_TTL` | `20` | 运维面板整块结果的短缓存（秒） |
 | `trust_proxy` | `GALLERY_TRUST_PROXY` | `false` | 是否信任 `X-Forwarded-Proto`（仅在自建反代后开启） |
 | `ops_refresh_rate_limit` | `GALLERY_OPS_REFRESH_RATE_LIMIT` | `6` | 每 IP 每分钟 `getOpsOverview&refresh=1` 的次数上限 |
 | `default_view` | `GALLERY_DEFAULT_VIEW` | `gallery` | 打开页面默认标签：`gallery` / `ops`（URL hash 优先） |
@@ -294,7 +303,10 @@ php -r "echo password_hash('你的强密码', PASSWORD_DEFAULT), PHP_EOL;" > sec
 1. **全链路鉴权**：`index.php` / `api.php` / `image.php` 三者都在输出任何内容前检查会话；未通过一律拒绝。
 2. **会话加固**：`HttpOnly` + `SameSite=Lax` + HTTPS 下自动 `Secure`；`use_strict_mode`；`use_only_cookies`；登录成功 `session_regenerate_id(true)`；空闲/绝对双超时。
 3. **密码策略**：只使用 `password_hash`/`password_verify`（bcrypt，`PASSWORD_DEFAULT`）；**明文登录分支已移除**（`Auth::attempt()` 只认哈希，`Config::hasPassword()` 只看哈希）；`hash_equals` 用于 CSRF token 抗时序比较。
-4. **登录限流**：按 IP 滑动窗口计数，超限锁定；成功登录清零计数。抵御暴力破解。
+4. **登录限流与冷却**：按 IP 滑动窗口计数，超限锁定 `login_lockout_seconds`；成功登录清零计数。AJAX 登录同样返回 `429` + `Retry-After`，前端据此在登录浮层内做倒计时。
+   - `login.php` 的 AJAX `GET`（会话超时后取新 `csrf_token`）受 `auth_token_rate_limit` 限制，避免刷会话文件。
+   - `logout.php` 的 POST 受 `auth_logout_rate_limit` 限制，避免登出请求刷会话。
+   - 上述接口超限均带 `Retry-After`，JSON 响应额外含 `retry_after` 字段。
 5. **CSRF**：登出等所有状态变更走 POST + CSRF token（`hash_equals` 校验）；token 来自会话，随会话失效。
 6. **安全响应头**（`Headers::apply`）：
    - 全站：`X-Content-Type-Options`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Cross-Origin-Opener-Policy`、`Cross-Origin-Resource-Policy`、`Permissions-Policy`、HTTPS 下 `HSTS`。
@@ -379,6 +391,12 @@ php -r "echo password_hash('你的强密码', PASSWORD_DEFAULT), PHP_EOL;" > sec
 | **缩略图磁盘缓存** | `Thumbnailer` | 网格加载 ~420px 小图而非 1920px 原图，并支持 304 |
 | **`session_write_close()` 早释放** | `api.php` / `image.php` | 否则 PHP 会话锁会让并发的图片请求串行化 |
 | **前端相邻图预加载** | `util.js` | 翻页/轮播切换无明显等待 |
+| **运维结果短缓存 + 降级** | `OpsMonitor` / `libraryStats` | 重复进入运维页直接命中缓存；重算失败退回上次成功结果 |
+| **每日统计按 mtime 复用** | `dayStats` | 手动刷新也不再全量 `stat` 每个文件 |
+| **前端请求超时/重试/去重** | `api.js` | 慢接口不会无限挂起；同查询请求合并 |
+| **渲染令牌防竞态** | `gallery.js` | 快速切换层级时旧响应不会覆盖新内容 |
+| **监控轮询退避 + 页面隐藏暂停** | `monitor.js` | 无新照片时不再按 1s 空转；后台标签页零轮询 |
+| **时间轴/尺寸监听合并到 rAF** | `viewer.js` / `app.js` | 高频事件不再触发成排重排与图片请求 |
 
 ---
 
@@ -387,25 +405,26 @@ php -r "echo password_hash('你的强密码', PASSWORD_DEFAULT), PHP_EOL;" > sec
 - **依赖**：PHP 7.4+（7.3 亦可用；本地以 8.4 验证）、`gd`、`json`、`session`、`fileinfo`。**无需** Composer / npm / 构建。
 - **Web 根目录**：指向 `web-ui/`；`captures_dir` 可指向外部真实库（`GALLERY_CAPTURES_DIR`）。
 - **首次配置**：**没有默认密码**——`Config::passwordHash()` 的取值优先级为 `password_hash_file` → `password_hash`，两者都为空则**任何人都无法登录**（明文 `password` 已停用、不参与认证）。至少设置一项；确认 `GALLERY_CAPTURES_DIR` 与权限；启用 HTTPS。
-- **Docker（php-fpm + nginx，卷映射）**：仓库里已备好一整套（与 `web-ui/` 同级）：
-  - `docker-compose.yml`：`php`（`phpdockerio/php:8.4-fpm`，`PHP_FPM_LISTEN=/var/run/php/php-fpm.sock`）+ `nginx`（`nginx:stable`，`${GALLERY_HTTP_PORT:-28080}:80`），共享 `php-socket` 卷，`camera-net` 桥接网络。
+- **Docker（php-fpm + nginx，卷映射）**：部署文件都在 **`nginx/`** 目录（与 `web-ui/` 同级）：
+  - `nginx/docker-compose.yml`：`php`（`phpdockerio/php:8.4-fpm`，`PHP_FPM_LISTEN=/var/run/php/php-fpm.sock`）+ `nginx`（`nginx:stable`，`${GALLERY_HTTP_PORT:-28080}:80`），共享 `php-socket` 卷，`camera-net` 桥接网络。**本文件的相对路径以 `nginx/` 为基准**：`./default.conf`、`../secrets/password_hash.txt`、`./.env`。
   - `nginx/default.conf`：`root /var/www/html`、`try_files … /index.php?$query_string`、`fastcgi_pass unix:/var/run/php/php-fpm.sock`；额外封掉 `config.php`、`^/src/`、敏感扩展名与点文件，并对 `^/assets/.*\.(js|css)$` 加 `Cache-Control: no-cache`。
-  - `.env.example`：**列出全部可覆盖变量**（32 个 `GALLERY_*` + 主机路径 + 端口），复制为 `.env` 按需修改；每个变量在 compose 里都写成 `${VAR:-默认值}`。
-  - `secrets/password_hash.txt.example` + compose 的 `secrets:` 段：密码哈希以**文件**挂进容器（`GALLERY_PASSWORD_HASH_FILE=/run/secrets/gallery_password_hash`）。
+  - `nginx/env.example`：**列出全部可覆盖变量**（`GALLERY_*` + 主机路径 + 端口），复制为 `nginx/.env` 按需修改；每个变量在 compose 里都写成 `${VAR:-默认值}`。
+  - `secrets/password_hash.txt.example`（仓库根）+ compose 的 `secrets:` 段：密码哈希以**文件**挂进容器（`GALLERY_PASSWORD_HASH_FILE=/run/secrets/gallery_password_hash`）。
   - 容器内的挂载点名不是固定的，所以**必须显式配置**，不要依赖默认值：
 
     ```yaml
     environment:
       - GALLERY_PASSWORD_HASH_FILE=/run/secrets/gallery_password_hash  # 见下方"为什么用文件"
       - GALLERY_CAPTURES_DIR=${GALLERY_CAPTURES_DIR:-/var/www/capture} # 容器内挂载点，名字随意
-      - GALLERY_HEALTH_FILE=${GALLERY_HEALTH_FILE:-/var/www/status.json}
+      - GALLERY_HEALTH_FILE=${GALLERY_HEALTH_FILE:-/var/www/logs/health.json}
       - GALLERY_IMAGE_MODE=${GALLERY_IMAGE_MODE:-proxy}                # 默认；图片经 image.php 鉴权输出
       - GALLERY_CACHE_DIR=${GALLERY_CACHE_DIR:-/tmp/gallery-cache}     # 代码目录 :ro，缓存必须另指可写路径
     volumes:
-      - ${GALLERY_CAPTURE_HOST_DIR:-/opt/camera/capture}:/var/www/capture:ro   # 只读（本 UI 绝不写照片库）
-      - ${GALLERY_STATUS_HOST_FILE:-/opt/camera/status.json}:/var/www/status.json:ro
+      - ${GALLERY_CAPTURE_HOST_DIR:-/opt/camera/captures}:/var/www/capture:ro   # 只读（本 UI 绝不写照片库）
+      - ${GALLERY_LOGS_HOST_DIR:-/opt/camera/logs}:/var/www/logs:ro            # 只读；health.json 在这里
     ```
 
+  - **健康文件的真实路径**：`capture.py` 把健康快照写到 **`LOG_DIR/health.json`**（默认 `/opt/camera/logs/health.json`），**不是** `status.json`。所以要把宿主 `logs/` 目录挂进容器再指向它，否则运维面板会一直报「未找到 health.json」。
   - 挂载点叫什么都可以（`/data/captures`、`/mnt/photos`…），只要与 `GALLERY_CAPTURES_DIR` 一致。`image_mode=proxy` 时它是**唯一需要的路径配置**。
   - **为什么密码走文件而不是环境变量**：compose 会对 `.env` 做变量插值，bcrypt 哈希里的 `$` 会被吞掉——`$2y$12$abc…` 会被解析成残缺的 `$$2y$$12`（尾部丢失），表现为「密码明明对却登不进去」。`secrets` 直接挂文件、不经过任何插值，因此安全。生成方式：`mkdir -p secrets && php -r "echo password_hash('你的强密码', PASSWORD_DEFAULT), PHP_EOL;" > secrets/password_hash.txt`（真实文件已 gitignore，只提交 `.example`）。
   - **代码目录挂 `:ro`**：本 UI 不写代码目录，因此缩略图/统计缓存**必须**由 `GALLERY_CACHE_DIR` 指向容器内可写路径（默认 `/tmp/gallery-cache`）。
@@ -472,12 +491,287 @@ GALLERY_CAPTURES_DIR=/path/to/real/or/demo/captures \
 
 ---
 
-## 14. 已知限制与后续想法
+## 14. 已知技术限制与后续迭代方向
 
-- **日期选择**：自建日历已实现「无照片日期不可选」；可用日期集合来自 `getAvailableDates`（5 分钟缓存），超大库首次打开日历时该列表会略慢。
-- **缩略图**：未处理 EXIF 旋转；若抓拍设备存在旋转场景需补充。
-- **时间轴**：使用 range 滑块而非缩略图胶片 —— 任意数据量下都轻量，但没有缩略图预览。
-- **时区**：展示已走文件名（正确）；若要让 `epoch` 本身也准确（例如将来做跨时区调度），请设置 `timezone` 配置。
-- **缓存位置**：默认在系统临时目录，重启即清空——对缩略图可接受，对索引缓存仅偶尔多一次扫描。
-- **鉴权模型**：单密码 + 会话（无多用户）。若未来要多用户/只读分享链接，建议引入带签名的临时 URL，而非放开 `captures/` 直链。
-- **大库扩展**：若单日照片量级远超当前假设（数万张），可考虑为日索引加持久化缓存（以目录 mtime 失效）。
+> **状态基线**：当前 `web-ui` 实现。
+> **优先级定义**：`P0` 阻断核心使用或存在安全风险；`P1` 影响核心体验、特定设备或大规模部署；`P2` 可感知但可接受；`P3` 纯增强项。
+> **影响范围**：标注到具体模块、接口、配置项；每个条目可直接拆分为后续迭代任务。
+
+| 条目 | 主要模块 | 主要影响 | 优先级 |
+|---|---|---|---|
+| 14.1 日期选择 | `datepicker.js` / `getAvailableDates` | 超大库首次打开日历有延迟 | P2（超大库 P1） |
+| 14.2 缩略图 | `Thumbnailer` / `image.php` | 旋转拍摄时方向错误 | P2（旋转设备 P1） |
+| 14.3 时间轴 | `viewer.js` | 无缩略图预览，仅体验增强 | P3 |
+| 14.4 时区 | `PhotoLibrary` / `timezone` | 跨时区调度与 `epoch` 准确性 | P2 |
+| 14.5 缓存 | `FileCache` / `cache_dir` | 重启后冷启动、磁盘占用 | P2（容器部署 P1） |
+| 14.6 鉴权 | `Auth` / `image.php` | 无多用户与只读分享 | P2（需分享时 P1） |
+| 14.7 大库扩展 | `PhotoLibrary` / 列表接口 | 超大响应、内存与渲染压力 | P1（超大规模） |
+
+### 14.1 日期选择模块
+
+**当前状态**
+- 已完成自定义日历组件「无照片日期禁用选择」；只有确实存在照片的日期可选，其余置灰划掉。
+- 可用日期数据源为 `getAvailableDates`；`PhotoLibrary::availableDates()` 通过 `FileCache` 的 `index` 命名空间缓存 **300 秒（5 分钟）**。
+- 支持上下界钳制、月份边界与键盘导航。
+
+**已知约束**
+- 超大照片库首次打开日历时，需要遍历 `monthDirs()` / `dayDirs()` 并对每天执行 `hasPhoto()`，存在可感知的加载延迟。
+- 5 分钟缓存意味着新写入的日期最多延迟 5 分钟才出现在日历中。
+- 当前一次返回全量 `availableDates`，没有按月份或时间窗口分片。
+
+**影响范围**
+- `assets/js/datepicker.js`、`PhotoLibrary::availableDates()`、`getAvailableDates`、`FileCache` 的 `index` 命名空间。
+- 仅影响日期选择器首次打开；不阻塞相册主网格加载。
+
+**优先级**
+- `P2`（默认）；当照片库积累多年、日目录数量很大且首次打开超过 1 秒时升为 `P1`。
+
+**后续优化方向**
+- 为可用日期增加**按月索引缓存**，以月份目录 `mtime` 失效，避免每次全库扫描。
+- 登录后或在首屏空闲时预取并预热 `availableDates`，把延迟移出用户点击动作。
+- 让 `getAvailableDates` 支持按月份/窗口查询，或先返回月份可用性、再按需加载该月日期。
+- 为响应增加 `ETag` / `304` 协商缓存，降低重复传输。
+
+### 14.2 缩略图模块
+
+**当前状态**
+- `Thumbnailer::forFile()` 使用 `getimagesize()` + `imagecreatefromjpeg()` + `imagecopyresampled()` 生成缩略图。
+- 缩略图缓存键为 `sourcePath|mtime|max|quality`，源文件变化后自动重算。
+- `image.php` 统一输出原图/缩略图/下载，支持 `ETag` 与 `304`。
+
+**已知约束**
+- 尚未解析 EXIF 方向信息，也没有自动旋转/翻转处理。
+- 若抓拍设备存在竖拍或传感器方向差异，网格缩略图与查看器原图都会保持未旋转方向。
+- 当前仅处理 JPEG；EXIF 解析还依赖 PHP `exif` 扩展是否可用。
+
+**影响范围**
+- `src/Thumbnailer.php`、`image.php`、`assets/js/gallery.js`、`assets/js/viewer.js`、缩略图缓存。
+- 不影响文件命名、时间解析与照片索引。
+
+**优先级**
+- `P2`（默认）；若部署设备存在旋转拍摄场景，升为 `P1`。
+
+**后续优化方向**
+- 读取 EXIF `Orientation`（1–8），在缩放前对 GD 画布执行旋转/翻转。
+- 将方向值纳入缩略图缓存键，避免方向修正后仍命中旧图。
+- 对原图通道提供可选的方向修正代理，或在 `photo` 对象中返回 `orientation` 供前端做 CSS 变换。
+- 增加 8 种方向的固定测试图片，覆盖缩略图与原图两条链路。
+
+### 14.3 时间轴交互
+
+**当前状态**
+- 查看器时间轴采用 `range` 滑块（`#viewerTimeline`），拖动即可跨分钟/小时跳转。
+- 已使用 `requestAnimationFrame` 合并高频 `input` 事件，避免一次拖动触发大量图片请求。
+- 时间轴两端只显示时刻，当前节点显示序号与时间。
+
+**已知约束**
+- 不支持时间轴节点的缩略图预览（非缩略图胶片方案）。
+- 拖动时只能看到时间文本，无法通过画面快速判断目标区间。
+- 缩略图胶片若直接铺满全部照片，会带来额外请求与内存压力。
+
+**影响范围**
+- `assets/js/viewer.js`、`assets/css/app.css` 中的 `.viewer-timeline` / `.tl-range`。
+- 不影响相册网格与层级导航。
+
+**优先级**
+- `P3`（纯体验增强）。
+
+**后续优化方向**
+- 保留 `range` 滑块作为大数量级默认方案；新增可选「胶片模式」。
+- 胶片模式只渲染当前节点前后少量缩略图（窗口化/虚拟列表），拖动结束后再批量预取。
+- 通过配置开关启用，避免在低性能设备上默认开启。
+
+### 14.4 时区处理
+
+**当前状态**
+- 展示时间一律来自文件名 `capture_YYYYMMDD_HHMMSS_ffffff.jpg` 派生值（`time` 字段及前端基于文件名解析的时刻），不依赖浏览器时区。
+- `epoch` 由服务器使用 `strtotime()` 计算；`timezone` 配置会在 `bootstrap.php` 中调用 `date_default_timezone_set()`。
+- 前端查看器的拍摄间隔与播放节奏基于 `epoch`。
+
+**已知约束**
+- 若 `timezone` 未设置，`epoch` 取决于 PHP 默认时区；跨时区调度或分析时可能产生偏移。
+- `epoch` 本身不携带时区标识，只是服务器时区下的秒级时间戳。
+- 浏览器与采集设备时区不一致时，不能用 `epoch` 反推时钟字符串（现有前端已避免这样做）。
+
+**影响范围**
+- `PhotoLibrary::photoInfo()`、`timezone` 配置、`assets/js/viewer.js` 的间隔计算、未来跨时区调度接口。
+
+**优先级**
+- `P2`。
+
+**后续优化方向**
+- 部署时显式设置 `timezone`（例如 `Asia/Shanghai`），并在部署文档中作为必检项。
+- 在 `photo` 对象中可选增加带偏移的 `captured_at`（ISO 8601）字段，同时保留 `epoch` 兼容现有前端。
+- 为跨时区调度补充 DST 边界测试；明确「展示用文件名、计算用 `epoch`」的契约。
+
+### 14.5 缓存策略
+
+**当前状态**
+- `cache_dir` 默认指向系统临时目录下的 `photo_gallery_cache`。
+- `FileCache` 命名空间包括 `index`（索引/可用日期/最新照片）、`stats`（每日统计/库统计）、`ops`（运维概览）、`ratelimit`（限流）；缩略图使用独立的 `thumbs` 子目录。
+- 每日统计按目录 `mtime` 复用；运维概览默认缓存 `ops_cache_ttl` 秒。
+
+**已知约束**
+- 系统临时目录在重启、容器重建或系统清理后会被清空，索引与缩略图需要重新生成。
+- 当前没有缓存总量上限或 LRU 淘汰策略，长期运行可能持续占用磁盘。
+- 统计与缩略图写入为直接覆盖，极端并发下缺少原子替换保证。
+
+**影响范围**
+- `src/Support/FileCache.php`、`src/Thumbnailer.php`、`src/Support/RateLimiter.php`、`src/OpsMonitor.php`。
+- 影响冷启动延迟、磁盘占用与容器部署稳定性。
+
+**优先级**
+- `P2`；容器化/临时文件系统部署且照片库很大时升为 `P1`。
+
+**后续优化方向**
+- 生产部署通过 `GALLERY_CACHE_DIR` 指向持久化卷（缩略图与索引分开更佳）。
+- 增加缩略图缓存容量上限与 LRU/按时间清理任务。
+- 写入改为「临时文件 + `rename()`」原子替换，降低并发读到半成品缓存的概率。
+- 暴露缓存命中率、大小与冷启动耗时指标，便于容量规划。
+
+### 14.6 鉴权模型
+
+**当前状态**
+- 单密码 + 会话：只接受 `password_hash` / `password_hash_file`，支持 CSRF、登录限流、空闲/绝对超时。
+- `image.php` 是默认图片通道（`image_mode=proxy`），`captures/` 目录由 `.htaccess` 禁止直接访问。
+- 页面、接口、图片三条路径独立鉴权。
+
+**已知约束**
+- 不支持多用户、角色与按用户撤销。
+- 不支持只读分享链接；共享访问需要直接提供密码。
+- 若改用 `image_mode=direct`，必须由 Web 服务器层自行实现鉴权，否则会绕过当前隐私模型。
+
+**影响范围**
+- `src/Security/Auth.php`、`Config` 的密码与会话配置、`image.php`、`api.php`、部署层 `.htaccess` / nginx 配置。
+
+**优先级**
+- 规划多用户或分享能力时为 `P1`；单用户自用场景为 `P2`。
+
+**后续优化方向**
+- 引入**带签名的临时 URL**：HMAC 签名 + 过期时间 + 路径范围 + 可选一次性 token，禁止直接开放 `captures/` 直链。
+- 若需要多用户，增加用户/角色存储与按用户会话撤销；分享链接单独限流与审计。
+- 保持 `image.php` 作为唯一图片通道；分享创建接口使用 POST + CSRF。
+- 补充签名过期、篡改、重放与越权路径测试。
+
+### 14.7 大库扩展能力
+
+**当前状态**
+- 以「字典序 == 时间序」的文件名约定构建单日索引：`PhotoLibrary::loadDayIndex()` 单次 `opendir` 后在内存中按小时/分钟分组。
+- 同一请求内索引复用；`latestPhoto`、每日统计、库统计已有文件缓存。
+- `getMinutePhotos`、`getPhotoListForRange` 当前返回区间内完整数组。
+
+**已知约束**
+- 「单日数十万张」尚未形成正式基准数据；`loadDayIndex()` 会把当天全部文件名载入 PHP 数组，内存与扫描耗时随文件数线性增长。
+- `getPhotoListForRange` 在全天/整小时轮播时会返回很大的 JSON；`getMinutePhotos` 在单分钟照片极多时同样会放大响应体。
+- 前端网格与查看器目前按返回数组整体渲染，缺少分页/虚拟列表；单分钟数千张时会造成 DOM 与内存压力。
+
+**影响范围**
+- `src/PhotoLibrary.php`、`src/Api/GalleryController.php`、`assets/js/gallery.js`、`assets/js/slideshow.js`、`assets/js/viewer.js`。
+- 影响大库的接口耗时、响应体大小、浏览器内存与首屏渲染。
+
+**优先级**
+- `P1`（当单日照片量级显著超过当前假设，或出现接口超时/浏览器卡顿时）。
+
+**后续优化方向**
+- 先补充基准测试：单日 1 万 / 10 万 / 50 万张下的扫描耗时、内存峰值与接口响应大小。
+- 为日索引增加**基于目录 `mtime` 失效的持久化缓存**（NDJSON 或 SQLite），避免每次进程重启后重新扫描。
+- 为 `getMinutePhotos` / `getPhotoListForRange` 增加游标分页与 `total` / `has_more` 字段；轮播按窗口分块加载。
+- 前端网格引入虚拟列表；查看器保持相邻图预加载，不一次性持有整个区间的图片对象。
+- 对超大响应增加服务端上限与明确错误提示，避免拖垮 PHP 进程或浏览器。
+
+### 14.8 建议迭代顺序
+
+1. **P1 大库能力**：先做 14.7 的基准测试、索引持久化与分页/虚拟列表。
+2. **P1 设备适配**：若存在旋转拍摄，落地 14.2 的 EXIF 方向修正。
+3. **P1/P2 分享能力**：需要共享时先实现 14.6 的签名临时 URL，再考虑多用户。
+4. **P2 基础设施**：14.5 持久化缓存与清理、14.1 可用日期增量缓存、14.4 时区配置固化。
+5. **P3 体验增强**：14.3 胶片模式（可选开关）。
+
+---
+
+## 15. 全面优化记录（web-ui）
+
+### 设计系统
+- `base.css` 令牌整体收敛：更小的圆角层级、更克制的阴影/辉光、统一的 36px 控件高度与 10px 圆角；正文增加字体平滑。
+- 移除 `background-attachment: fixed`（移动端滚动持续重绘），降低 `backdrop-filter` 半径，并为不支持模糊的浏览器提供不透明回退。
+- 响应式：≤760px 工具条改为三行网格（操作 / 面包屑 / 层级统计），面包屑横向滚动；≤480px 网格固定两列；查看器高度改为 100% 舞台 + 可滚动信息区，修复小屏溢出。
+- 触屏（`hover: none`）直接展示瓦片元信息，避免字幕永远不可见。
+
+### 动效
+- 运维统计卡错峰入场、面板切换重放 `panelIn`、请求失败时状态条滑入；查看器/外观面板增加退场动画。
+- `.reveal` 默认可见，即使 IntersectionObserver 不触发也不会出现空白面板。
+- 所有动画继续尊重 `prefers-reduced-motion`。
+
+### 性能
+- 首屏骨架直接写在 `index.php`；新增 `getDateBounds` 合并上下界请求；模块预加载。
+- 网格瓦片使用 `contain: layout paint`；时间轴拖动与窗口尺寸监听合并到 `requestAnimationFrame`。
+- 监控：页面隐藏时暂停轮询；无新照片时按 1.25× 退避；停止时取消在途请求；面包屑只更新时间文本，不再每秒重建 DOM。
+- 相册：渲染令牌丢弃过期响应，避免快速切层级时旧数据覆盖新内容。
+
+### 稳健性（运维页无响应专项）
+- `api.js` 增加默认 12s 超时、可配置重试、同查询去重、外部 `AbortSignal`；超时/网络/5xx 有明确中文提示。
+- 运维面板：首次加载显示骨架，刷新时保留旧内容并显示「更新中」；失败可在面板内重试，首次失败自动重试一次；并发请求被抑制、过期响应被丢弃。
+- 后端：`getOpsOverview` 整块结果缓存 `ops_cache_ttl`（默认 20s）；`libraryStats` 聚合缓存；`dayStats` 以目录 mtime 为准（即使手动刷新也复用未变化的一天）；全部重算失败时回退到上一次成功结果并标记 `degraded`。
+
+### 验证
+- 22 个 PHP 文件 `php -l` 全部通过。
+- 用 378 张演示照片完成端到端验证：登录、全部 9 个既有 action + `getDateBounds`、图片/缩略图、参数错误 400。
+- 运维接口实测：冷启动约 14ms、命中缓存约 2ms、`refresh=1` 约 4ms；缩略图冷/热约 13ms / 2ms。
+- 浏览器实测：相册 7 个瓦片与 24 小时活动条正常渲染；运维页 4 张统计卡、3 个面板、31 行图表、11 行服务信息、10 行存储/安全信息正常渲染，无横向溢出、无 JS 控制台报错。
+
+---
+
+## 16. 无刷新交互（AJAX 登录 / 登出 / History）
+
+### 16.1 设计目标
+- 正常使用流程（登录、登出、会话超时恢复、相册钻取、视图切换）不再触发整页刷新。
+- 页面刷新只作为降级手段保留：禁用 JavaScript、旧浏览器、取不到新 CSRF token 等异常场景。
+- 安全模型不变：`api.php`、`image.php` 仍然独立鉴权；未登录的 `index.php` 只输出静态壳层，不含任何照片数据。
+
+### 16.2 登录 / 登出
+- `index.php` 不再对未登录访问做 302：
+  - 返回 `200`，渲染 `#authOverlay` 登录浮层；
+  - `<body data-authenticated="0">`、`#appRoot` 标记 `aria-hidden="true"`；
+  - 浮层表单的 `action="login.php"` 保留，作为无 JS 时的原生回退。
+- `login.php` 在 `Accept: application/json` 或 `X-Requested-With: XMLHttpRequest` 时返回 JSON：
+  - 成功：`{"ok":true,"csrf_token":"…"}`；
+  - 失败：`{"error":"…"}` + 对应 HTTP 状态（`401` 密码错误、`403` CSRF 失效、`429` 限流）。
+  - `429` 额外返回 `retry_after`，并带 `Retry-After` 响应头；前端据此禁用提交并显示倒计时。
+  - `GET` + AJAX 用于会话超时后获取新的 `csrf_token`，受 `auth_token_rate_limit` 限制。
+- `logout.php` 同样支持 JSON；AJAX 分支调用 `Auth::logout(false)`：
+  - 清空认证数据并 `session_regenerate_id(true)`，保留会话；
+  - 返回新的 `csrf_token`，页面无需刷新即可继续显示登录浮层。
+- 前端 `app.js`：
+  - 拦截 `#authForm` / `#logoutForm` 的 `submit`，使用 `fetch` + `FormData`；
+  - 登录成功更新所有 `input[name="csrf_token"]` 与 `meta[name="csrf-token"]`，隐藏浮层并启动数据；
+  - 登出成功后调用 `resetAppData()`：停止监控、关闭查看器、清空相册与运维 DOM/状态；
+  - 会话超时由 `api.js` 派发 `gallery:unauthorized` 事件，页面内获取新 token 并显示登录浮层；
+  - `api.js` 同时设置 1.2 秒兜底：若页面没有处理器，才回退到 `index.php?error=session_timeout`。
+
+### 16.3 History API
+- `showView()` 使用 `history.pushState` / `replaceState` 记录：
+  ```js
+  { view: 'gallery' | 'ops', gallery: { level, date, hour, slot, minute }, galleryHistory: [...] }
+  ```
+- 相册的 `navigate()` / `jumpTo()` / `resetToDate()` / `goBack()` 通过 `gallery:state` 事件同步浏览器历史。
+- `popstate` 恢复视图与层级，不重新加载页面；浏览器前进/后退可直接回到上一个日期或钻取层级。
+- 登出后 `popstate` 不再恢复旧视图（`authenticated === false` 时直接保持在登录浮层），避免旧数据回到 DOM。
+
+### 16.4 关键约束
+- 未登录时 `index.php` 仍会加载 CSS/JS，但不会请求任何 JSON 数据；所有数据接口继续返回 401。
+- CSRF token 在登录、软登出、会话超时恢复后都会轮换并同步到页面，避免出现「密码正确但表单 403」。
+- `logout.php` 的非 AJAX 分支仍返回 `303 → login.php?logged_out=1`；`login.php` 的非 AJAX 分支仍返回 `302 → index.php`。
+- 页面仍禁止内联脚本/样式；AJAX 请求全部由 `assets/js` 模块发起，符合现有 CSP。
+
+### 16.5 验证基线
+- `php -l` 全部通过。
+- AJAX 登录：`200 {"ok":true,"csrf_token":…}`；错误密码 `401`；错误 CSRF `403`。
+- AJAX 登出：`200 {"ok":true,"csrf_token":…}`；登出后 `api.php` 与 `image.php` 均返回 `401`；使用轮换后的 token 可再次登录。
+- 会话超时：在页内显示「会话已超时，请重新登录。」，无整页刷新；新 token 可直接用于再次登录。
+- History：相册钻取后浏览器后退恢复上一层级；`#gallery` ↔ `#ops` 切换与后退均无整页刷新；登出后旧历史不会恢复照片数据。
+- 限速与冷却（低阈值实测：attempts=2、lockout=8s、token/logout=2 次/分）：
+  - 连续错误密码第 3 次返回 `429`，JSON 含 `retry_after`，响应头含 `Retry-After`；
+  - 锁定期内即使密码正确也返回 `429`；锁定期结束后恢复 `200`；
+  - AJAX 取 token 第 3 次返回 `429`；
+  - 登出第 3 次返回 `429`；
+  - 登录浮层在收到 `429` 后禁用提交并显示逐秒倒计时，结束自动恢复。

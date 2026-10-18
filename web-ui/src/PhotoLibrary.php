@@ -345,6 +345,16 @@ final class PhotoLibrary
 
     public function libraryStats(bool $refresh = false): array
     {
+        $limit = max(1, Config::getInt('stats_recent_days', 31));
+        $cacheKey = 'library_stats:' . $this->baseDir . ':' . $limit;
+
+        if (!$refresh) {
+            $cached = FileCache::get($cacheKey, 'stats');
+            if (is_array($cached)) {
+                return $cached;
+            }
+        }
+
         $byMonth = [];
         $recentDays = [];
         $months = 0;
@@ -360,7 +370,7 @@ final class PhotoLibrary
 
             foreach ($this->dayDirs($month) as $day) {
                 $date = $month . '-' . $day;
-                $stat = $this->dayStats($this->baseDir . '/' . $month . '/' . $day, $refresh);
+                $stat = $this->dayStats($this->baseDir . '/' . $month . '/' . $day);
                 if ($stat['files'] === 0) {
                     continue;
                 }
@@ -389,8 +399,6 @@ final class PhotoLibrary
             ];
         }
 
-        $limit = max(1, Config::getInt('stats_recent_days', 14));
-
         /* 构造连续窗口（含 0 张的日子），柱状图才是真正的时间轴而不是「有数据的那几天」 */
         $recent = [];
         $endTs = $latest !== null ? strtotime($latest . ' 12:00:00') : false;
@@ -407,7 +415,7 @@ final class PhotoLibrary
             }
         }
 
-        return [
+        $result = [
             'months' => $months,
             'dates' => count($recentDays),
             'total_files' => $totalFiles,
@@ -419,20 +427,30 @@ final class PhotoLibrary
             'window_days' => $limit,
             'computed_at' => time(),
         ];
+
+        FileCache::set(
+            $cacheKey,
+            $result,
+            max(15, Config::getInt('ops_cache_ttl', 20)),
+            'stats'
+        );
+
+        return $result;
     }
 
-    private function dayStats(string $dir, bool $refresh): array
+    private function dayStats(string $dir): array
     {
         $mtime = @filemtime($dir) ?: 0;
         $key = 'day_stats:' . $dir;
 
-        if (!$refresh) {
-            $cached = FileCache::get($key, 'stats');
-            if (is_array($cached)
-                && isset($cached['mtime'], $cached['files'], $cached['bytes'])
-                && $cached['mtime'] === $mtime) {
-                return ['files' => (int) $cached['files'], 'bytes' => (int) $cached['bytes']];
-            }
+        /* 目录 mtime 是"这一天内容有没有变"的权威信号。
+           即使手动刷新也优先复用它：否则每次刷新都会把所有文件重新 stat 一遍，
+           在几万张照片的库上会造成运维页长时间无响应。 */
+        $cached = FileCache::getStale($key, 'stats');
+        if (is_array($cached)
+            && isset($cached['mtime'], $cached['files'], $cached['bytes'])
+            && $cached['mtime'] === $mtime) {
+            return ['files' => (int) $cached['files'], 'bytes' => (int) $cached['bytes']];
         }
 
         $files = 0;

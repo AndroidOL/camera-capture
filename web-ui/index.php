@@ -10,12 +10,35 @@ require __DIR__ . '/src/bootstrap.php';
 
 Headers::apply('page');
 
-if (!Auth::isAuthenticated()) {
-    header('Location: login.php?error=unauthorized');
-    exit;
+/* 未登录不再整页跳转：渲染同一套壳层 + 登录浮层，登录/登出全部走 AJAX。
+   页面本身不含任何照片数据；api.php / image.php 仍然独立鉴权。 */
+$authenticated = Auth::isAuthenticated();
+
+/* 会话可能因空闲/绝对超时被 Auth::isAuthenticated() 销毁；
+   此时重新建立会话，保证登录浮层拿到的 CSRF token 是有效且可持久化的。 */
+if (!$authenticated && session_status() !== PHP_SESSION_ACTIVE) {
+    Auth::startSession();
 }
 
 $csrfToken = Csrf::token();
+
+$authMessage = '';
+if (!$authenticated) {
+    if (isset($_GET['error'])) {
+        if ($_GET['error'] === 'session_timeout') {
+            $authMessage = '会话已超时，请重新登录。';
+        } elseif ($_GET['error'] === 'unauthorized') {
+            $authMessage = '您需要登录才能访问。';
+        }
+    }
+    if ($authMessage === '' && isset($_GET['logged_out'])) {
+        $authMessage = '已退出登录。';
+    }
+    if ($authMessage === '' && !Config::hasPassword()) {
+        $authMessage = '尚未配置访问密码，请先设置 GALLERY_PASSWORD_HASH 或 config.php 的 password_hash。';
+    }
+}
+
 $theme = Theme::mode();
 $accent = Theme::accent();
 $accents = Theme::accents();
@@ -32,24 +55,27 @@ $monitorMax = Config::getInt('monitor_max_interval', 8000);
 <html lang="zh-CN" data-theme="<?= $theme ?>" data-accent="<?= htmlspecialchars($accent, ENT_QUOTES, 'UTF-8') ?>">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="robots" content="noindex, nofollow">
     <meta name="color-scheme" content="<?= $theme === 'light' ? 'light' : 'dark' ?>">
     <meta name="csrf-token" content="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
-    <meta name="theme-color" content="<?= $theme === 'light' ? '#f5f6f9' : '#07080b' ?>">
+    <meta name="theme-color" content="<?= $theme === 'light' ? '#f6f7f9' : '#0a0b0f' ?>">
     <title>照片查看器</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%236a9dff'/%3E%3Cpath d='M9 6l-1 1.5H6A1.5 1.5 0 0 0 4.5 9v6A1.5 1.5 0 0 0 6 16.5h12a1.5 1.5 0 0 0 1.5-1.5V9A1.5 1.5 0 0 0 18 7.5h-2L15 6H9Zm3 8.5a2.75 2.75 0 1 1 0-5.5 2.75 2.75 0 0 1 0 5.5Z' fill='%2305070c'/%3E%3C/svg%3E">
+    <link rel="modulepreload" href="<?= Asset::url('assets/js/app.js') ?>">
     <link rel="stylesheet" href="<?= Asset::url('assets/css/base.css') ?>">
     <link rel="stylesheet" href="<?= Asset::url('assets/css/app.css') ?>">
     <link rel="stylesheet" href="<?= Asset::url('assets/css/admin.css') ?>">
 </head>
 <body
+    data-authenticated="<?= $authenticated ? '1' : '0' ?>"
     data-view="<?= htmlspecialchars($initialView, ENT_QUOTES, 'UTF-8') ?>"
     data-speed="<?= (int) $slideshowSpeed ?>"
     data-download="<?= $downloadEnabled ? '1' : '0' ?>"
     data-monitor-initial="<?= (int) $monitorInitial ?>"
     data-monitor-min="<?= (int) $monitorMin ?>"
     data-monitor-max="<?= (int) $monitorMax ?>">
-    <div class="app">
+    <div class="app" id="appRoot" aria-hidden="<?= $authenticated ? 'false' : 'true' ?>"<?= $authenticated ? '' : ' inert' ?>>
         <header class="topbar">
             <div class="brand">
                 <span class="brand-mark" aria-hidden="true">
@@ -91,9 +117,9 @@ $monitorMax = Config::getInt('monitor_max_interval', 8000);
                     </div>
                 </div>
 
-                <form method="post" action="logout.php" class="logout-form">
+                <form id="logoutForm" method="post" action="logout.php" class="logout-form">
                     <?= Csrf::field() ?>
-                    <button type="submit" class="btn btn-ghost">登出</button>
+                    <button type="submit" id="logoutButton" class="btn btn-ghost">登出</button>
                 </form>
             </div>
         </header>
@@ -141,7 +167,15 @@ $monitorMax = Config::getInt('monitor_max_interval', 8000);
                 <p id="status" class="status" role="status" aria-live="polite" hidden></p>
                 <p id="loading" class="loading" role="alert" aria-busy="true" hidden><span class="spinner"></span>正在加载…</p>
 
-                <section id="gallery" class="grid" aria-live="polite"></section>
+                <section id="gallery" class="grid" aria-live="polite">
+                    <!-- 首帧占位：JS 启动前也有稳定的网格结构，避免白屏跳动 -->
+                    <div class="tile-skeleton skeleton" aria-hidden="true"></div>
+                    <div class="tile-skeleton skeleton" aria-hidden="true"></div>
+                    <div class="tile-skeleton skeleton" aria-hidden="true"></div>
+                    <div class="tile-skeleton skeleton" aria-hidden="true"></div>
+                    <div class="tile-skeleton skeleton" aria-hidden="true"></div>
+                    <div class="tile-skeleton skeleton" aria-hidden="true"></div>
+                </section>
 
                 <section id="monitor" class="monitor" hidden>
                     <div class="monitor-stage">
@@ -174,17 +208,22 @@ $monitorMax = Config::getInt('monitor_max_interval', 8000);
                     </div>
 
                     <div id="opsWarnings" class="ops-warnings" hidden></div>
-                    <div id="opsStats" class="stat-grid"></div>
+                    <div id="opsStats" class="stat-grid" aria-busy="true">
+                        <div class="skeleton stat-skeleton" aria-hidden="true"></div>
+                        <div class="skeleton stat-skeleton" aria-hidden="true"></div>
+                        <div class="skeleton stat-skeleton" aria-hidden="true"></div>
+                        <div class="skeleton stat-skeleton" aria-hidden="true"></div>
+                    </div>
 
                     <div class="panel-grid">
                         <section class="card panel reveal">
                             <div class="panel-head"><h3 class="panel-title">采集服务</h3></div>
-                            <div id="opsService" class="kv"></div>
+                            <div id="opsService" class="kv"><div class="skeleton panel-skeleton" aria-hidden="true"></div></div>
                         </section>
 
                         <section class="card panel reveal">
                             <div class="panel-head"><h3 class="panel-title">存储与安全</h3></div>
-                            <div id="opsStorageSecurity" class="panel-stack"></div>
+                            <div id="opsStorageSecurity" class="panel-stack"><div class="skeleton panel-skeleton" aria-hidden="true"></div></div>
                         </section>
 
                         <section class="card panel reveal panel-wide">
@@ -193,12 +232,44 @@ $monitorMax = Config::getInt('monitor_max_interval', 8000);
                                 <span class="spacer"></span>
                                 <span id="opsChartPeak" class="panel-hint"></span>
                             </div>
-                            <div id="opsChart" class="chart"></div>
+                            <div id="opsChart" class="chart"><div class="skeleton panel-skeleton" aria-hidden="true"></div></div>
                         </section>
                     </div>
                 </div>
             </section>
         </main>
+    </div>
+
+    <noscript>
+        <p class="status is-error noscript-note">此页面需要启用 JavaScript 才能浏览照片与查看运维数据。</p>
+    </noscript>
+
+    <div id="authOverlay" class="auth-overlay" role="dialog" aria-modal="true" aria-label="登录" <?= $authenticated ? 'hidden' : '' ?>>
+        <div class="auth-card">
+            <div class="auth-brand">
+                <span class="brand-mark auth-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24"><path d="M9 2 7.2 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-3.2L15 2H9Zm3 15a5 5 0 1 1 0-10 5 5 0 0 1 0 10Z"/></svg>
+                </span>
+                <div>
+                    <h1 class="auth-title">照片查看器</h1>
+                    <p class="auth-sub" id="authSub">请输入访问密码</p>
+                </div>
+            </div>
+
+            <form id="authForm" method="post" action="login.php" autocomplete="off" novalidate>
+                <?= Csrf::field() ?>
+                <label class="auth-label" for="authPassword">密码</label>
+                <div class="auth-field">
+                    <input type="password" id="authPassword" name="password" required autocomplete="current-password">
+                    <button type="button" id="authToggle" class="auth-toggle" aria-label="显示或隐藏密码">显示</button>
+                </div>
+                <p id="authCaps" class="auth-caps" hidden>注意：大写锁定已开启</p>
+                <p id="authError" class="auth-error" role="alert" <?= $authMessage === '' ? 'hidden' : '' ?>><?= htmlspecialchars($authMessage, ENT_QUOTES, 'UTF-8') ?></p>
+                <button type="submit" id="authSubmit" class="btn btn-accent btn-block">登 录</button>
+            </form>
+
+            <footer class="auth-footer">© <?= date('Y') ?> 相机系统</footer>
+        </div>
     </div>
 
     <div id="viewer" class="overlay" hidden role="dialog" aria-modal="true" aria-label="图片查看">

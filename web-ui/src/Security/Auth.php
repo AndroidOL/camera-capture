@@ -84,11 +84,27 @@ final class Auth
         $_SESSION['user_agent'] = isset($_SERVER['HTTP_USER_AGENT']) ? substr((string) $_SERVER['HTTP_USER_AGENT'], 0, 255) : '';
     }
 
-    public static function logout(): void
+    /**
+     * 登出。
+     *
+     * $destroy = true  —— 彻底销毁会话（页面跳转式登出、会话超时）。
+     * $destroy = false —— 软登出：清空认证数据并轮换 Session ID，但保留会话，
+     *                     便于 AJAX 登出后立即拿到新的 CSRF token 继续在页内登录。
+     */
+    public static function logout(bool $destroy = true): void
     {
         $_SESSION = [];
 
-        if (session_status() === PHP_SESSION_ACTIVE && ini_get('session.use_cookies')) {
+        if (session_status() !== PHP_SESSION_ACTIVE) {
+            return;
+        }
+
+        if (!$destroy) {
+            session_regenerate_id(true);
+            return;
+        }
+
+        if (ini_get('session.use_cookies')) {
             $params = session_get_cookie_params();
             setcookie(
                 session_name(),
@@ -104,9 +120,7 @@ final class Auth
             );
         }
 
-        if (session_status() === PHP_SESSION_ACTIVE) {
-            session_destroy();
-        }
+        session_destroy();
     }
 
     public static function clientIp(): string

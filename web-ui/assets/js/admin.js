@@ -1,9 +1,16 @@
-import { apiGet } from './api.js';
+import { apiGet, isCancelled } from './api.js';
 import { create, el } from './dom.js';
 import { animateWidth, countUp } from './anim.js';
 import { formatFileSize } from './util.js';
 
+const REQUEST_TIMEOUT = 15000;
+const AUTO_RETRY_DELAY = 2500;
+
 let loaded = false;
+let loading = false;
+let sequence = 0;
+let lastData = null;
+let retryTimer = null;
 
 export function initAdmin() {
     if (el.opsRefresh) {
@@ -11,54 +18,187 @@ export function initAdmin() {
             loadAdmin(true);
         });
     }
+
+    document.addEventListener('click', (event) => {
+        const retry = event.target && event.target.closest ? event.target.closest('[data-ops-retry]') : null;
+        if (retry) {
+            loadAdmin(true);
+        }
+    });
+
+    window.addEventListener('online', () => {
+        if (!loaded && !loading) {
+            loadAdmin(false);
+        }
+    });
 }
 
 export function ensureAdminLoaded() {
-    if (!loaded) {
+    if (!loaded && !loading) {
         loadAdmin(false);
     }
 }
 
 export function reloadAdmin() {
     loaded = false;
+    lastData = null;
     loadAdmin(false);
 }
 
-async function loadAdmin(refresh) {
-    showSkeletons();
-    if (el.opsRefresh) {
-        el.opsRefresh.disabled = true;
+/**
+ * 登出时清空运维数据与模块状态，避免旧会话信息残留在 DOM 中。
+ * 递增 sequence 可让仍在途的请求结果被直接丢弃。
+ */
+export function resetAdminState() {
+    sequence++;
+    loaded = false;
+    loading = false;
+    lastData = null;
+
+    if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
     }
 
-    let data;
-    try {
-        data = await apiGet('getOpsOverview', refresh ? { refresh: 1 } : {}, {});
-    } catch (error) {
-        renderFailure(error.message);
+    if (el.opsStats) {
+        el.opsStats.textContent = '';
+        el.opsStats.setAttribute('aria-busy', 'false');
+    }
+    if (el.opsWarnings) {
+        el.opsWarnings.textContent = '';
+        el.opsWarnings.hidden = true;
+    }
+    if (el.opsService) {
+        el.opsService.textContent = '';
+    }
+    if (el.opsStorageSecurity) {
+        el.opsStorageSecurity.textContent = '';
+    }
+    if (el.opsChart) {
+        el.opsChart.textContent = '';
+    }
+    if (el.opsChartPeak) {
+        el.opsChartPeak.textContent = '';
+    }
+    if (el.opsUpdated) {
+        el.opsUpdated.textContent = '';
+        el.opsUpdated.title = '';
+    }
+    if (el.opsPill) {
+        el.opsPill.className = 'pill pill-mute';
+        el.opsPill.textContent = '读取中';
+    }
+    if (el.opsRefresh) {
+        el.opsRefresh.disabled = false;
+        el.opsRefresh.classList.remove('is-busy');
+    }
+}
+
+async function loadAdmin(refresh) {
+    if (loading) {
         return;
+    }
+
+    loading = true;
+    const token = ++sequence;
+    const firstLoad = !lastData;
+
+    if (firstLoad) {
+        showSkeletons();
+    }
+    setBusy(true, firstLoad ? '读取中' : '更新中');
+
+    if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
+    }
+
+    try {
+        const data = await apiGet(
+            'getOpsOverview',
+            refresh ? { refresh: 1 } : {},
+            {
+                silent: true,
+                timeout: REQUEST_TIMEOUT,
+                dedupe: true,
+                retries: 0,
+            }
+        );
+
+        if (!data || token !== sequence) {
+            return;
+        }
+
+        lastData = data;
+        loaded = true;
+        renderAll(data);
+    } catch (error) {
+        if (token !== sequence || isCancelled(error)) {
+            return;
+        }
+
+        if (lastData) {
+            showInlineError(error.message);
+            renderPill(lastData.service, lastData.storage);
+        } else {
+            renderFailure(error.message);
+        }
+
+        /* 首次进入就失败时自动再试一次，避免瞬时网络抖动让面板一直空着 */
+        if (firstLoad) {
+            retryTimer = window.setTimeout(() => {
+                retryTimer = null;
+                if (!loaded && !loading) {
+                    loadAdmin(false);
+                }
+            }, AUTO_RETRY_DELAY);
+        }
     } finally {
-        if (el.opsRefresh) {
-            el.opsRefresh.disabled = false;
+        if (token === sequence) {
+            loading = false;
+            setBusy(false);
         }
     }
+}
 
-    if (!data) {
-        return;
+function setBusy(active, label) {
+    if (el.opsRefresh) {
+        el.opsRefresh.disabled = active;
+        el.opsRefresh.classList.toggle('is-busy', active);
     }
+    if (el.opsStats) {
+        el.opsStats.setAttribute('aria-busy', active ? 'true' : 'false');
+    }
+    if (active && label && el.opsPill) {
+        el.opsPill.className = 'pill pill-mute';
+        el.opsPill.textContent = label;
+    }
+}
 
-    loaded = true;
-    renderPill(data.service, data.storage);
-    renderStats(data.library, data.storage);
-    renderService(data.service);
-    renderStorageSecurity(data.storage, data.security);
+function renderAll(data) {
+    const service = data.service || {};
+    const storage = data.storage || {};
+    const security = data.security || {};
+    const library = data.library || {};
+
+    renderPill(service, storage);
+    renderStats(library, storage);
+    renderService(service);
+    renderStorageSecurity(storage, security);
     renderWarnings(data.warnings);
-    renderChart(data.library.recent_days, data.library.window_days);
+    renderChart(library.recent_days, library.window_days);
 
     if (el.opsUpdated) {
-        const at = data.library.computed_at
-            ? new Date(data.library.computed_at * 1000).toLocaleTimeString('zh-CN', { hour12: false })
+        const seconds = data.generated_at || library.computed_at;
+        const at = seconds
+            ? new Date(seconds * 1000).toLocaleTimeString('zh-CN', { hour12: false })
             : '';
-        el.opsUpdated.textContent = at ? '统计于 ' + at : '';
+        let text = at ? '统计于 ' + at : '';
+        if (data.from_cache) {
+            text += text ? ' · 缓存' : '缓存数据';
+        }
+        el.opsUpdated.textContent = text;
+        el.opsUpdated.title = data.degraded ? '部分数据不可用，已降级展示' : '';
     }
 }
 
@@ -96,18 +236,59 @@ function renderFailure(message) {
         return;
     }
     el.opsStats.textContent = '';
-    const card = create('div', 'card panel');
-    card.appendChild(create('p', 'empty-note', '加载运维数据失败：' + message));
+
+    const card = create('div', 'card panel ops-error');
+    card.appendChild(create('p', 'ops-error-title', '加载运维数据失败'));
+    card.appendChild(create('p', 'empty-note', message || '请稍后重试。'));
+
+    const retry = create('button', 'btn btn-accent', '重新加载');
+    retry.type = 'button';
+    retry.dataset.opsRetry = '1';
+    card.appendChild(retry);
+
     el.opsStats.appendChild(card);
+
+    if (el.opsService) {
+        el.opsService.textContent = '';
+    }
+    if (el.opsStorageSecurity) {
+        el.opsStorageSecurity.textContent = '';
+    }
+    if (el.opsChart) {
+        el.opsChart.textContent = '';
+    }
 
     if (el.opsPill) {
         el.opsPill.className = 'pill pill-danger';
         el.opsPill.textContent = '读取失败';
     }
+    if (el.opsUpdated) {
+        el.opsUpdated.textContent = '';
+    }
 }
 
-function buildStat(label, unit, hint) {
+function showInlineError(message) {
+    if (!el.opsWarnings) {
+        return;
+    }
+    el.opsWarnings.textContent = '';
+
+    const row = create('div', 'warn-row warn-row-error');
+    row.appendChild(create('span', 'warn-dot'));
+    row.appendChild(create('span', 'warn-text', '刷新失败：' + (message || '未知错误') + '（当前展示上一次成功结果）'));
+
+    const retry = create('button', 'btn btn-ghost btn-sm', '重试');
+    retry.type = 'button';
+    retry.dataset.opsRetry = '1';
+    row.appendChild(retry);
+
+    el.opsWarnings.appendChild(row);
+    el.opsWarnings.hidden = false;
+}
+
+function buildStat(label, unit, hint, index) {
     const card = create('div', 'card stat-card');
+    card.style.setProperty('--i', String(index));
     card.appendChild(create('span', 'stat-label', label));
 
     const value = create('span', 'stat-value');
@@ -131,20 +312,27 @@ function renderStats(library, storage) {
     }
     el.opsStats.textContent = '';
 
-    const totalFiles = buildStat('照片总数', '张', library.months + ' 个月 · ' + library.dates + ' 天有照片');
+    const totalFiles = buildStat(
+        '照片总数',
+        '张',
+        (library.months || 0) + ' 个月 · ' + (library.dates || 0) + ' 天有照片',
+        0
+    );
     el.opsStats.appendChild(totalFiles.card);
-    countUp(totalFiles.number, library.total_files, {});
+    countUp(totalFiles.number, library.total_files || 0, {});
 
     const span = library.earliest && library.latest ? library.earliest + ' → ' + library.latest : '—';
-    const totalSize = buildStat('库总体积', null, span);
+    const totalSize = buildStat('库总体积', null, span, 1);
     el.opsStats.appendChild(totalSize.card);
-    countUp(totalSize.number, library.total_bytes, { format: (value) => formatFileSize(value) });
+    countUp(totalSize.number, library.total_bytes || 0, {
+        format: (value) => formatFileSize(value),
+    });
 
-    const dateStat = buildStat('覆盖天数', '天', library.months + ' 个月份目录');
+    const dateStat = buildStat('覆盖天数', '天', (library.months || 0) + ' 个月份目录', 2);
     el.opsStats.appendChild(dateStat.card);
-    countUp(dateStat.number, library.dates, {});
+    countUp(dateStat.number, library.dates || 0, {});
 
-    const diskStat = buildStat('磁盘使用率', '%', storage.warn_percent + '% 触发清理告警');
+    const diskStat = buildStat('磁盘使用率', '%', (storage.warn_percent || 85) + '% 触发清理告警', 3);
     el.opsStats.appendChild(diskStat.card);
     if (storage.used_percent === null || storage.used_percent === undefined) {
         diskStat.number.textContent = '—';
@@ -156,7 +344,11 @@ function renderStats(library, storage) {
 function kvRow(key, value, valueClass) {
     const row = create('div', 'kv-row');
     row.appendChild(create('span', 'kv-key', key));
-    const val = create('span', 'kv-val', value === null || value === undefined || value === '' ? '—' : String(value));
+    const val = create(
+        'span',
+        'kv-val',
+        value === null || value === undefined || value === '' ? '—' : String(value)
+    );
     if (valueClass) {
         val.classList.add(valueClass);
     }
@@ -172,7 +364,7 @@ function renderService(service) {
 
     if (!service.available) {
         el.opsService.appendChild(
-            create('p', 'empty-note', '未找到采集服务的健康文件：' + service.health_file)
+            create('p', 'empty-note', '未找到采集服务的健康文件：' + (service.health_file || '—'))
         );
         el.opsService.appendChild(kvRow('健康文件', service.health_file));
         return;
@@ -237,7 +429,10 @@ function renderStorageSecurity(storage, security) {
             create(
                 'span',
                 null,
-                '已用 ' + formatFileSize(storage.used_bytes) + ' / ' + formatFileSize(storage.total_bytes)
+                '已用 ' +
+                    formatFileSize(storage.used_bytes) +
+                    ' / ' +
+                    formatFileSize(storage.total_bytes)
             )
         );
         legend.appendChild(create('span', null, storage.used_percent + '%'));
@@ -262,14 +457,16 @@ function renderStorageSecurity(storage, security) {
         dirSuffix = ' · 不可读';
         dirClass = 'is-warn';
     }
-    storageKv.appendChild(kvRow('照片库', storage.path + dirSuffix, dirClass));
+    storageKv.appendChild(kvRow('照片库', (storage.path || '—') + dirSuffix, dirClass));
     storageKv.appendChild(
         kvRow(
             '可用空间',
-            storage.free_bytes === null || storage.free_bytes === undefined ? '—' : formatFileSize(storage.free_bytes)
+            storage.free_bytes === null || storage.free_bytes === undefined
+                ? '—'
+                : formatFileSize(storage.free_bytes)
         )
     );
-    storageKv.appendChild(kvRow('告警阈值', storage.warn_percent + '%'));
+    storageKv.appendChild(kvRow('告警阈值', (storage.warn_percent || 85) + '%'));
     stack.appendChild(storageKv);
 
     /* ---- 安全 ---- */
@@ -278,20 +475,23 @@ function renderStorageSecurity(storage, security) {
     const securityKv = create('div', 'kv');
 
     let passwordLabel = '未设置';
-    if (security && security.password_mode === 'hash') {
+    if (security.password_mode === 'hash') {
         passwordLabel = 'bcrypt 哈希';
-    } else if (security && security.password_mode === 'plaintext') {
+    } else if (security.password_mode === 'plaintext') {
         passwordLabel = '明文（已停用，请改用哈希）';
     }
     securityKv.appendChild(kvRow('密码', passwordLabel));
-    securityKv.appendChild(kvRow('HTTPS', security && security.https ? '已启用' : '未启用'));
+    securityKv.appendChild(kvRow('HTTPS', security.https ? '已启用' : '未启用'));
     securityKv.appendChild(
-        kvRow('会话 Cookie', security && security.cookie_secure ? 'Secure · HttpOnly · SameSite' : 'HttpOnly · SameSite')
+        kvRow(
+            '会话 Cookie',
+            security.cookie_secure ? 'Secure · HttpOnly · SameSite' : 'HttpOnly · SameSite'
+        )
     );
-    securityKv.appendChild(kvRow('Cookie 前缀', security ? security.cookie_prefix : '—'));
-    securityKv.appendChild(kvRow('图片通道', security && security.image_mode === 'proxy' ? '鉴权代理' : '直链'));
-    securityKv.appendChild(kvRow('代理信任', security && security.trust_proxy ? '已开启 trust_proxy' : '关闭'));
-    securityKv.appendChild(kvRow('robots.txt', security && security.robots_blocked ? '已禁止抓取' : '缺失'));
+    securityKv.appendChild(kvRow('Cookie 前缀', security.cookie_prefix || '—'));
+    securityKv.appendChild(kvRow('图片通道', security.image_mode === 'proxy' ? '鉴权代理' : '直链'));
+    securityKv.appendChild(kvRow('代理信任', security.trust_proxy ? '已开启 trust_proxy' : '关闭'));
+    securityKv.appendChild(kvRow('robots.txt', security.robots_blocked ? '已禁止抓取' : '缺失'));
     stack.appendChild(securityKv);
 
     wrap.appendChild(stack);
@@ -312,7 +512,7 @@ function renderWarnings(warnings) {
     list.forEach((text) => {
         const row = create('div', 'warn-row');
         row.appendChild(create('span', 'warn-dot'));
-        row.appendChild(create('span', null, text));
+        row.appendChild(create('span', 'warn-text', text));
         el.opsWarnings.appendChild(row);
     });
     el.opsWarnings.hidden = false;
@@ -369,7 +569,6 @@ function renderChart(recentDays, windowDays) {
         row.appendChild(track);
 
         row.appendChild(create('span', 'drow-count', String(day.files)));
-
         grid.appendChild(row);
 
         const percent = max > 0 ? (day.files / max) * 100 : 0;
@@ -382,9 +581,11 @@ function renderPill(service, storage) {
     if (!el.opsPill) {
         return;
     }
+    service = service || {};
+    storage = storage || {};
     el.opsPill.className = 'pill';
 
-    if (storage && storage.status === 'warning') {
+    if (storage.status === 'warning') {
         el.opsPill.classList.add('pill-warn');
         el.opsPill.textContent = '磁盘告警';
         return;
