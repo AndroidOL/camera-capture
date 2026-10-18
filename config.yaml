@@ -1,5 +1,5 @@
 # ==============================================================================
-# Configuration file for Image Capture Service (v3.1.2)
+# Configuration file for Image Capture Service (v3.2.0)
 # ==============================================================================
 
 # --- Path Settings ---
@@ -9,8 +9,8 @@ paths:
   base_app_dir: "/opt/camera"   # Base directory for logs and other app files
   log_dir: "{base_app_dir}/logs"                      # Directory to store log files
   pid_file: "/var/run/image_capture_service.pid"      # PID file for service management
-  image_save_base_dir: "{base_app_dir}/capture"          # Primary directory to save captured images
-  image_save_fallback_dir: "{base_app_dir}/capture_emmc" # Optional: Fallback if primary fails (e.g. different disk)
+  image_save_base_dir: "{base_app_dir}/captures"          # Primary directory to save captured images
+  image_save_fallback_dir: "{base_app_dir}/captures-emmc" # Optional: Fallback if primary fails (e.g. different disk)
 
 # --- Logging Configuration ---
 logging:
@@ -23,12 +23,20 @@ logging:
   syslog_tag: "ImageCaptureSvc" # Tag used for syslog messages
 
 # --- Camera Configuration ---
+# 稳定设备路径优先使用 /dev/v4l/by-id/...；编号 /dev/videoN 可能随枚举变化。
+# 该键为顶层键，脚本通过 flat.get("camera_device") 读取。
+camera_device: "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._UGREEN_Camera_2K_SN0001-video-index0"
+
 camera:
-  index_preference: "2" # Preferred camera index: "0", "1", ..., or "any" to try finding one
+  index_preference: "2" # 保留字段：当前版本不参与打开设备，实际使用顶层 camera_device
   width: 1920           # Requested frame width
   height: 1080          # Requested frame height
-  requested_fourcc: "YUYV" # Requested camera FOURCC (e.g., YUYV, MJPG). Case-sensitive.
+  # USB 2.0 下 YUYV 1080p 接近带宽上限，实测偶发横向撕裂；MJPG 更稳定。
+  requested_fourcc: "MJPG" # Requested camera FOURCC (e.g., YUYV, MJPG). Case-sensitive.
   jpeg_quality: 75      # JPEG save quality (0-100, higher is better quality/larger size)
+  frame_flush_grabs: 4  # 每次 read 前丢弃的旧帧数量
+  open_timeout_msec: 5000   # OpenCV 支持时生效
+  read_timeout_msec: 5000   # 防止 USB 读帧永久阻塞（OpenCV 支持时生效）
   
   # Retry and backoff parameters for camera operations
   parameter_set_retries: 3
@@ -46,11 +54,17 @@ capture_schedule:
   # Defines intervals active *until* the end_time_exclusive.
   # Times are in HH:MM or HH:MM:SS format. Sorted by end_time_exclusive.
   # The first rule implies starting from 00:00.
+  # 与 capture.py 内置时间表保持一致：
+  #   00:00-05:00 10s；05:00-09:00 5s；09:00-11:30 2s；
+  #   11:30-14:00 5s；14:00-21:30 2s；21:30-23:00 5s；23:00-24:00 10s。
   schedule_rules:
-    - {end_time_exclusive: "04:30", interval_seconds: 15} # 00:00:00 - 04:29:59
-    - {end_time_exclusive: "06:00", interval_seconds: 10} # 04:30:00 - 05:59:59
-    - {end_time_exclusive: "22:00", interval_seconds: 5}  # 06:00:00 - 21:59:59
-  # Interval for times >= the last end_time_exclusive in schedule_rules (i.e., 22:00 to midnight)
+    - {end_time_exclusive: "05:00", interval_seconds: 10} # 00:00:00 - 04:59:59
+    - {end_time_exclusive: "09:00", interval_seconds: 5}  # 05:00:00 - 08:59:59
+    - {end_time_exclusive: "11:30", interval_seconds: 2}  # 09:00:00 - 11:29:59
+    - {end_time_exclusive: "14:00", interval_seconds: 5}  # 11:30:00 - 13:59:59
+    - {end_time_exclusive: "21:30", interval_seconds: 2}  # 14:00:00 - 21:29:59
+    - {end_time_exclusive: "23:00", interval_seconds: 5}  # 21:30:00 - 22:59:59
+  # Interval for times >= the last end_time_exclusive in schedule_rules (i.e., 23:00 to midnight)
   default_interval_late_night: 10
 
 # --- Image Processing Configuration ---
@@ -76,11 +90,16 @@ disk_management:
   cleanup_batch_days: 1                 # Number of oldest days to delete in one cleanup cycle if over threshold
   check_interval_seconds: 43200         # How often to check disk space (e.g., 3600 = 1 hour)
   min_jpeg_save_size_bytes: 15360       # Minimum size in bytes for a saved JPEG to be considered valid (5KB)
+  protect_recent_days: 1                # 清理时至少保留最近 N 天，避免删除正在写入的当天目录
 
 # --- Service Control Configuration ---
 service:
-  max_consecutive_imwrite_failures: 5 # Max consecutive image save failures before service considers stopping
-  systemd_watchdog_usec: null         # systemd Watchdog interval in microseconds (e.g., 30000000 for 30s).
-                                      # If set by systemd via WATCHDOG_USEC env var, that takes precedence.
-                                      # Script will ping watchdog at roughly half this interval.
-                                      # Requires python-systemd library. Set to null or 0 to disable.
+  max_consecutive_imwrite_failures: 5 # Max consecutive image save failures before service backs off
+  camera_recycle_seconds: 86400       # 每 24h 释放并重连一次相机；0=禁用
+  memory_warn_mb: 600                 # RSS 软告警阈值
+  memory_limit_mb: 800                # RSS 硬阈值：释放相机 + 强制 gc
+  gc_interval_seconds: 3600           # 周期性 gc 间隔
+  health_dump_interval_seconds: 60    # health.json 写入间隔
+  systemd_watchdog_usec: null         # 兼容字段；实际由 systemd 的 WATCHDOG_USEC 环境变量驱动。
+                                      # 脚本无需 python-systemd，直接通过 NOTIFY_SOCKET 发送
+                                      # READY=1 / WATCHDOG=1 / STOPPING=1。
